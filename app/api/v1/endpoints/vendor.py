@@ -6,14 +6,14 @@ from app.core.config import settings
 
 router = APIRouter()
 
-@router.get("/vendor/games", summary="Fetch upcoming games via provider")
+@router.get("/vendor/games", summary="Fetch upcoming or listed games via provider")
 async def vendor_games(
     league: str = Query(..., pattern="^(nba|ncaab|nfl|ncaaf|soccer)$"),
-    date: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    season: Optional[str] = Query(None, description="Pass-through; e.g. NBA/NCAAB '2024-2025', NFL/NCAAF '2024'"),
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (UTC)"),
+    season: Optional[str] = Query(None, description="NBA/NCAAB: 2024-2025 (preferred) or 2024; NFL/NCAAF/Soccer: 2024"),
     limit: Optional[int] = Query(25, ge=1, le=200),
-    compact: bool = Query(False, description="Return only id,start,teams"),
-    soccer_league_id: Optional[int] = Query(None, description="Soccer competition id (e.g. 39 EPL, 253 MLS)"),
+    compact: bool = Query(False, description="Return only id, start, teams"),
+    soccer_league_id: Optional[int] = Query(None, description="Soccer competition id (e.g. 39=EPL, 253=MLS)"),
     provider = Depends(provider_dep),
 ):
     try:
@@ -22,28 +22,31 @@ async def vendor_games(
         )
         if compact:
             return {
-                "league": league, "count": len(books),
-                "games": [{
-                    "game_id": b.game.game_id,
-                    "start_iso": b.game.start_iso,
-                    "home": {"name": b.game.home.name, "abbr": b.game.home.abbr},
-                    "away": {"name": b.game.away.name, "abbr": b.game.away.abbr},
-                } for b in books],
+                "league": league,
+                "count": len(books),
+                "games": [
+                    {
+                        "game_id": b.game.game_id,
+                        "start_iso": b.game.start_iso,
+                        "home": {"name": b.game.home.name, "abbr": b.game.home.abbr},
+                        "away": {"name": b.game.away.name, "abbr": b.game.away.abbr},
+                    } for b in books
+                ],
             }
         return {"league": league, "games": [b.game.model_dump() for b in books]}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"provider_error: {e}")
 
-@router.get("/vendor/games/history", summary="Historical games via provider")
+@router.get("/vendor/games/history", summary="Historical games via provider (date window or season window)")
 async def vendor_games_history(
     league: str = Query(..., pattern="^(nba|ncaab|nfl|ncaaf|soccer)$"),
     date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    season_from: Optional[str] = Query(None),
-    season_to: Optional[str] = Query(None),
+    season_from: Optional[str] = Query(None, description="NBA/NCAAB: 2024-2025 or 2024; NFL/NCAAF/Soccer: 2024"),
+    season_to: Optional[str] = Query(None, description="Same format as season_from"),
     limit: Optional[int] = Query(500, ge=1, le=2000),
-    compact: bool = Query(True),
-    soccer_league_id: Optional[int] = Query(None, description="Soccer competition id"),
+    compact: bool = Query(True, description="Return only id, start, teams (default true here)"),
+    soccer_league_id: Optional[int] = Query(None, description="Soccer competition id (e.g. 39=EPL)"),
     provider = Depends(provider_dep),
 ):
     try:
@@ -55,13 +58,16 @@ async def vendor_games_history(
         )
         if compact:
             return {
-                "league": league, "count": len(books),
-                "games": [{
-                    "game_id": b.game.game_id,
-                    "start_iso": b.game.start_iso,
-                    "home": {"name": b.game.home.name, "abbr": b.game.home.abbr},
-                    "away": {"name": b.game.away.name, "abbr": b.game.away.abbr},
-                } for b in books],
+                "league": league,
+                "count": len(books),
+                "games": [
+                    {
+                        "game_id": b.game.game_id,
+                        "start_iso": b.game.start_iso,
+                        "home": {"name": b.game.home.name, "abbr": b.game.home.abbr},
+                        "away": {"name": b.game.away.name, "abbr": b.game.away.abbr},
+                    } for b in books
+                ],
             }
         return {"league": league, "games": [b.game.model_dump() for b in books]}
     except Exception as e:
