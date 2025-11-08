@@ -2,6 +2,7 @@
 import os
 from typing import Optional, Literal, List, Tuple, Any
 import httpx
+from datetime import date
 
 from app.domain.models import Game, Team, MarketBook
 
@@ -12,54 +13,44 @@ BASKETBALL_BASE = os.getenv("APISPORTS_BASE_BASKETBALL", "https://v1.basketball.
 
 # API-Sports league ids
 BASKETBALL_LEAGUE_ID = {"nba": "12", "ncaab": "7"}
-FOOTBALL_LEAGUE_ID = {"nfl": "1", "ncaaf": "2"}  # American football (not soccer)
+FOOTBALL_LEAGUE_ID = {"nfl": "1", "ncaaf": "2"}
 
-def _normalize_season(league: League, season: Optional[str]) -> Optional[str]:
-    """Basketball allows '2024-2025' but API expects the starting year '2024'."""
-    if not season:
+def _base_and_path(league: League) -> Tuple[str, str]:
+    if league in ("nba", "ncaab"):
+        return BASKETBALL_BASE, "games"
+    return FOOTBALL_BASE, "fixtures"
+
+def _expand_basketball_season(s: Optional[str]) -> Optional[str]:
+    """NBA/NCAAB want YYYY-YYYY. If caller sends YYYY, expand to YYYY-(YYYY+1)."""
+    if not s:
         return None
-    s = str(season)
-    if league in ("nba", "ncaab") and "-" in s:
+    s = str(s)
+    if "-" in s:
+        return s  # already expanded
+    # single year -> expand
+    try:
+        y = int("".join(ch for ch in s if ch.isdigit()))
+        return f"{y}-{y+1}"
+    except Exception:
+        return None
+
+def _coerce_gridiron_season(s: Optional[str]) -> Optional[str]:
+    """NFL/NCAAF accept single starting year (YYYY). If YYYY-YYYY is passed, keep the first year."""
+    if not s:
+        return None
+    s = str(s)
+    if "-" in s:
         s = s.split("-")[0]
     digits = "".join(ch for ch in s if ch.isdigit())
     return digits or None
 
-def _base_and_path(league: League) -> Tuple[str, str]:
-    """Return (base, endpoint) for the given league."""
-    if league in ("nba", "ncaab"):
-        return BASKETBALL_BASE, "games"
-    # NFL, NCAAF and Soccer share the football host; endpoint is 'fixtures'
-    return FOOTBALL_BASE, "fixtures"
-
 def _val_to_iso(v: Any) -> str:
-    """
-    Coerce API-Sports date value to ISO string.
-    - Sometimes a string
-    - Sometimes dict: {"timezone":"UTC","date":"2024-10-01T00:00:00+00:00","timestamp":...}
-    """
+    # API-Sports sometimes returns a dict with 'date'/'utc'
     if isinstance(v, str):
         return v
     if isinstance(v, dict):
         return v.get("date") or v.get("utc") or ""
     return ""
-
-def _extract_teams(league: League, g: dict) -> Tuple[dict, dict]:
-    """
-    Return (home, away) team dicts in a league-agnostic way.
-    Basketball uses 'visitors' instead of 'away'.
-    Soccer/football/NFL use 'away'.
-    """
-    teams = g.get("teams", {}) or {}
-    # basketball v1 uses 'visitors'
-    home = teams.get("home") or g.get("home", {}) or {}
-    away = teams.get("away") or teams.get("visitors") or g.get("away", {}) or {}
-    return home, away
-
-def _abbr(t: dict) -> str:
-    """Pick a short code if present, otherwise fallback."""
-    return (t.get("code") or t.get("short") or t.get("abbr") or "").strip() or (
-        (t.get("name") or "X")[:3].upper()
-    )
 
 def _map_games(league: League, rows: list) -> List[MarketBook]:
     out: List[MarketBook] = []
@@ -71,22 +62,19 @@ def _map_games(league: League, rows: list) -> List[MarketBook]:
                 or g.get("game", {}).get("id")
                 or "unknown"
             )
-
-            # Normalize date to ISO
-            raw_date = (
+            start_iso = _val_to_iso(
                 g.get("date")
                 or g.get("fixture", {}).get("date")
                 or g.get("game", {}).get("date")
                 or ""
             )
-            start_iso = _val_to_iso(raw_date)
-
-            # Normalize teams
-            home_raw, away_raw = _extract_teams(league, g)
-            home_name = home_raw.get("name") or "Home"
-            away_name = away_raw.get("name") or "Away"
-            home_abbr = _abbr(home_raw) or "HOME"
-            away_abbr = _abbr(away_raw) or "AWY"
+            teams = g.get("teams") or {}
+            home = teams.get("home") or g.get("home", {}) or {}
+            away = teams.get("away") or g.get("away", {}) or {}
+            home_name = home.get("name", "Home")
+            away_name = away.get("name", "Away")
+            home_abbr = home.get("code") or home.get("short") or "HOME"
+            away_abbr = away.get("code") or away.get("short") or "AWY"
 
             game = Game(
                 game_id=gid,
@@ -97,9 +85,7 @@ def _map_games(league: League, rows: list) -> List[MarketBook]:
             )
             out.append(MarketBook(game=game, lines=[]))
         except Exception as e:
-            # If anything odd appears in a single row, don't drop the whole response.
-            print(f"[apisports] mapping error: {e} | row sample keys={list(g.keys())}")
-            continue
+            print(f"[apisports] skip row due to mapping error: {e} | keys={list(g.keys())}")
     return out
 
 class ApiSportsProvider:
@@ -108,36 +94,39 @@ class ApiSportsProvider:
         self.client = httpx.AsyncClient(timeout=20)
 
     def _headers(self) -> dict:
-        # Native API-Sports auth header (NOT RapidAPI)
         return {"x-apisports-key": self.key}
 
     async def list_games(
         self,
         league: League,
         *,
-        date: Optional[str] = None,             # YYYY-MM-DD
-        season: Optional[str] = None,           # NBA/NCAAB '2024' or '2024-2025'; NFL/NCAAF/Soccer '2024'
+        date: Optional[str] = None,
+        season: Optional[str] = None,
         limit: Optional[int] = None,
-        soccer_league_id: Optional[int] = None, # e.g., EPL=39, MLS=253
+        soccer_league_id: Optional[int] = None,
     ) -> List[MarketBook]:
         base, path = _base_and_path(league)
         url = f"{base}/{path}"
 
         params: dict = {"timezone": "UTC"}
+
         if league in ("nba", "ncaab"):
             params["league"] = BASKETBALL_LEAGUE_ID[league]
+            if season:
+                params["season"] = _expand_basketball_season(season)
         elif league in ("nfl", "ncaaf"):
             params["league"] = FOOTBALL_LEAGUE_ID[league]
+            if season:
+                params["season"] = _coerce_gridiron_season(season)
         else:  # soccer
             if soccer_league_id:
                 params["league"] = str(soccer_league_id)
+            if season:
+                params["season"] = _coerce_gridiron_season(season)
 
         if date:
+            # basketball uses 'date', football fixtures uses 'date' as well
             params["date"] = date
-
-        norm_season = _normalize_season(league, season)
-        if norm_season:
-            params["season"] = norm_season
 
         out: List[MarketBook] = []
         page = 1
@@ -148,16 +137,15 @@ class ApiSportsProvider:
             body = r.json()
             batch = body.get("response", []) or []
             if not batch:
-                # Helpful noise in Render logs while we iterate on params/allowlist
                 print(f"[apisports] empty batch page={page} url={url} params={params}")
             out.extend(_map_games(league, batch))
 
             if limit and len(out) >= limit:
                 return out[:limit]
 
-            paging = body.get("paging") or {}
-            cur = int(paging.get("current", page))
-            tot = int(paging.get("total", page))
+            pg = body.get("paging") or {}
+            cur = int(pg.get("current", page))
+            tot = int(pg.get("total", page))
             if cur >= tot or not batch:
                 break
             page += 1
@@ -168,8 +156,8 @@ class ApiSportsProvider:
         self,
         league: League,
         *,
-        date_from: Optional[str] = None,   # YYYY-MM-DD
-        date_to: Optional[str] = None,     # YYYY-MM-DD
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
         season_from: Optional[str] = None,
         season_to: Optional[str] = None,
         limit: Optional[int] = 500,
@@ -179,7 +167,7 @@ class ApiSportsProvider:
         url = f"{base}/{path}"
         out: List[MarketBook] = []
 
-        # Strategy 1: date window
+        # Date window
         if date_from or date_to:
             params: dict = {"timezone": "UTC"}
             if league in ("nba", "ncaab"):
@@ -201,37 +189,54 @@ class ApiSportsProvider:
                 r.raise_for_status()
                 body = r.json()
                 batch = body.get("response", []) or []
-                if not batch:
-                    print(f"[apisports] empty history batch page={page} url={url} params={params}")
                 out.extend(_map_games(league, batch))
                 if limit and len(out) >= limit:
                     return out[:limit]
-                paging = body.get("paging") or {}
-                cur = int(paging.get("current", page))
-                tot = int(paging.get("total", page))
-                if cur >= tot or not batch:
+                pg = body.get("paging") or {}
+                if int(pg.get("current", page)) >= int(pg.get("total", page)) or not batch:
                     break
                 page += 1
             return out if not limit else out[:limit]
 
-        # Strategy 2: season window
-        s_from = _normalize_season(league, season_from)
-        s_to = _normalize_season(league, season_to)
-        if s_from and not s_to:
-            s_to = s_from
-        if s_to and not s_from:
-            s_from = s_to
+        # Season window
+        if league in ("nba", "ncaab"):
+            # expand both ends for basketball
+            if season_from:
+                season_from = _expand_basketball_season(season_from)
+            if season_to:
+                season_to = _expand_basketball_season(season_to)
+        else:
+            if season_from:
+                season_from = _coerce_gridiron_season(season_from)
+            if season_to:
+                season_to = _coerce_gridiron_season(season_to)
 
-        if s_from and s_to:
-            for yr in range(int(s_from), int(s_to) + 1):
-                params: dict = {"timezone": "UTC", "season": str(yr)}
+        if season_from and not season_to:
+            season_to = season_from
+        if season_to and not season_from:
+            season_from = season_to
+
+        if season_from and season_to:
+            if league in ("nba", "ncaab"):
+                # Iterate start years but send expanded form
+                start_year = int(season_from.split("-")[0])
+                end_year = int(season_to.split("-")[0])
+                years = range(start_year, end_year + 1)
+            else:
+                years = range(int(season_from), int(season_to) + 1)
+
+            for yr in years:
+                params: dict = {"timezone": "UTC"}
                 if league in ("nba", "ncaab"):
                     params["league"] = BASKETBALL_LEAGUE_ID[league]
+                    params["season"] = f"{yr}-{yr+1}"
                 elif league in ("nfl", "ncaaf"):
                     params["league"] = FOOTBALL_LEAGUE_ID[league]
+                    params["season"] = str(yr)
                 else:
                     if soccer_league_id:
                         params["league"] = str(soccer_league_id)
+                    params["season"] = str(yr)
 
                 page = 1
                 while True:
@@ -240,15 +245,11 @@ class ApiSportsProvider:
                     r.raise_for_status()
                     body = r.json()
                     batch = body.get("response", []) or []
-                    if not batch:
-                        print(f"[apisports] empty season batch page={page} season={yr} url={url} params={params}")
                     out.extend(_map_games(league, batch))
                     if limit and len(out) >= limit:
                         return out[:limit]
-                    paging = body.get("paging") or {}
-                    cur = int(paging.get("current", page))
-                    tot = int(paging.get("total", page))
-                    if cur >= tot or not batch:
+                    pg = body.get("paging") or {}
+                    if int(pg.get("current", page)) >= int(pg.get("total", page)) or not batch:
                         break
                     page += 1
 
