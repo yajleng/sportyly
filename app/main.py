@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.api.v1.endpoints import ping as ping_endpoint
+from app.api.v1.endpoints import vendor as vendor_endpoint
+api_v1.include_router(vendor_endpoint.router)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
