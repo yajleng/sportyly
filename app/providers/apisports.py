@@ -122,4 +122,112 @@ class ApiSportsProvider:
             params["season"] = norm
 
         # If user sends nothing, default to today's window would produce sparse data;
-        # we’ll just let the API ret
+        # we’ll just let the API return whatever matches (may be empty).
+        out: List[MarketBook] = []
+        page = 1
+        while True:
+            params["page"] = page
+            r = await self.client.get(url, headers=self._headers(), params=params)
+            r.raise_for_status()
+            body = r.json()
+            batch = body.get("response", [])
+            out.extend(_map_games(league, batch))
+
+            if limit and len(out) >= limit:
+                return out[:limit]
+
+            pg = body.get("paging") or {}
+            cur = int(pg.get("current", page))
+            tot = int(pg.get("total", page))
+            if cur >= tot or not batch:
+                break
+            page += 1
+
+        return out if not limit else out[:limit]
+
+    async def list_games_range(
+        self,
+        league: League,
+        *,
+        date_from: Optional[str] = None,   # YYYY-MM-DD
+        date_to: Optional[str] = None,     # YYYY-MM-DD
+        season_from: Optional[str] = None,
+        season_to: Optional[str] = None,
+        limit: Optional[int] = 500,
+        soccer_league_id: Optional[int] = None,
+    ) -> List[MarketBook]:
+        base, path = _base_and_path(league)
+        url = f"{base}/{path}"
+        out: List[MarketBook] = []
+
+        # Date window
+        if date_from or date_to:
+            params: dict = {"timezone": "UTC"}
+            if league in ("nba", "ncaab"):
+                params["league"] = BASKETBALL_LEAGUE_ID[league]
+            elif league in ("nfl", "ncaaf"):
+                params["league"] = "1" if league == "nfl" else "2"
+            else:
+                if soccer_league_id:
+                    params["league"] = str(soccer_league_id)
+
+            if date_from:
+                params["from"] = date_from
+            if date_to:
+                params["to"] = date_to
+
+            page = 1
+            while True:
+                params["page"] = page
+                r = await self.client.get(url, headers=self._headers(), params=params)
+                r.raise_for_status()
+                body = r.json()
+                batch = body.get("response", [])
+                out.extend(_map_games(league, batch))
+                if limit and len(out) >= limit:
+                    return out[:limit]
+                pg = body.get("paging") or {}
+                if int(pg.get("current", page)) >= int(pg.get("total", page)) or not batch:
+                    break
+                page += 1
+            return out if not limit else out[:limit]
+
+        # Season window
+        s_from = _normalize_season(league, season_from)
+        s_to = _normalize_season(league, season_to)
+        if s_from and not s_to:
+            s_to = s_from
+        if s_to and not s_from:
+            s_from = s_to
+
+        if s_from and s_to:
+            for yr in range(int(s_from), int(s_to) + 1):
+                params: dict = {"timezone": "UTC", "season": str(yr)}
+                if league in ("nba", "ncaab"):
+                    params["league"] = BASKETBALL_LEAGUE_ID[league]
+                elif league in ("nfl", "ncaaf"):
+                    params["league"] = "1" if league == "nfl" else "2"
+                else:
+                    if soccer_league_id:
+                        params["league"] = str(soccer_league_id)
+
+                page = 1
+                while True:
+                    params["page"] = page
+                    r = await self.client.get(url, headers=self._headers(), params=params)
+                    r.raise_for_status()
+                    body = r.json()
+                    batch = body.get("response", [])
+                    out.extend(_map_games(league, batch))
+                    if limit and len(out) >= limit:
+                        return out[:limit]
+                    pg = body.get("paging") or {}
+                    if int(pg.get("current", page)) >= int(pg.get("total", page)) or not batch:
+                        break
+                    page += 1
+
+        # Nothing specified: return empty rather than guessing
+        return out if not limit else out[:limit]
+
+    async def aclose(self):
+        await self.client.aclose()
