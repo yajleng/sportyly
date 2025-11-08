@@ -2,7 +2,6 @@
 import os
 from typing import Optional, Literal, List, Tuple, Any
 import httpx
-from datetime import date
 
 from app.domain.models import Game, Team, MarketBook
 
@@ -11,41 +10,17 @@ League = Literal["nba", "ncaab", "nfl", "ncaaf", "soccer"]
 FOOTBALL_BASE = os.getenv("APISPORTS_BASE_FOOTBALL", "https://v3.football.api-sports.io")
 BASKETBALL_BASE = os.getenv("APISPORTS_BASE_BASKETBALL", "https://v1.basketball.api-sports.io")
 
-# API-Sports league ids
 BASKETBALL_LEAGUE_ID = {"nba": "12", "ncaab": "7"}
-FOOTBALL_LEAGUE_ID = {"nfl": "1", "ncaaf": "2"}
+FOOTBALL_LEAGUE_ID = {"nfl": "1", "ncaaf": "2"}  # API-Sports “fixtures” leagues
 
 def _base_and_path(league: League) -> Tuple[str, str]:
+    # NBA/NCAAB -> basketball/games, NFL/NCAAF/Soccer -> football/fixtures
     if league in ("nba", "ncaab"):
         return BASKETBALL_BASE, "games"
     return FOOTBALL_BASE, "fixtures"
 
-def _expand_basketball_season(s: Optional[str]) -> Optional[str]:
-    """NBA/NCAAB want YYYY-YYYY. If caller sends YYYY, expand to YYYY-(YYYY+1)."""
-    if not s:
-        return None
-    s = str(s)
-    if "-" in s:
-        return s  # already expanded
-    # single year -> expand
-    try:
-        y = int("".join(ch for ch in s if ch.isdigit()))
-        return f"{y}-{y+1}"
-    except Exception:
-        return None
-
-def _coerce_gridiron_season(s: Optional[str]) -> Optional[str]:
-    """NFL/NCAAF accept single starting year (YYYY). If YYYY-YYYY is passed, keep the first year."""
-    if not s:
-        return None
-    s = str(s)
-    if "-" in s:
-        s = s.split("-")[0]
-    digits = "".join(ch for ch in s if ch.isdigit())
-    return digits or None
-
 def _val_to_iso(v: Any) -> str:
-    # API-Sports sometimes returns a dict with 'date'/'utc'
+    # API-Sports can return a plain string or a dict with “date”
     if isinstance(v, str):
         return v
     if isinstance(v, dict):
@@ -85,7 +60,7 @@ def _map_games(league: League, rows: list) -> List[MarketBook]:
             )
             out.append(MarketBook(game=game, lines=[]))
         except Exception as e:
-            print(f"[apisports] skip row due to mapping error: {e} | keys={list(g.keys())}")
+            print(f"[apisports] skip row: {e} | keys={list(g.keys())}")
     return out
 
 class ApiSportsProvider:
@@ -100,8 +75,8 @@ class ApiSportsProvider:
         self,
         league: League,
         *,
-        date: Optional[str] = None,
-        season: Optional[str] = None,
+        date: Optional[str] = None,           # YYYY-MM-DD (optional)
+        season: Optional[str] = None,         # pass through as caller provided
         limit: Optional[int] = None,
         soccer_league_id: Optional[int] = None,
     ) -> List[MarketBook]:
@@ -112,21 +87,16 @@ class ApiSportsProvider:
 
         if league in ("nba", "ncaab"):
             params["league"] = BASKETBALL_LEAGUE_ID[league]
-            if season:
-                params["season"] = _expand_basketball_season(season)
         elif league in ("nfl", "ncaaf"):
             params["league"] = FOOTBALL_LEAGUE_ID[league]
-            if season:
-                params["season"] = _coerce_gridiron_season(season)
-        else:  # soccer
+        else:  # soccer (caller supplies competition id)
             if soccer_league_id:
                 params["league"] = str(soccer_league_id)
-            if season:
-                params["season"] = _coerce_gridiron_season(season)
 
         if date:
-            # basketball uses 'date', football fixtures uses 'date' as well
             params["date"] = date
+        if season:
+            params["season"] = str(season)  # no normalization — send as given
 
         out: List[MarketBook] = []
         page = 1
@@ -136,8 +106,6 @@ class ApiSportsProvider:
             r.raise_for_status()
             body = r.json()
             batch = body.get("response", []) or []
-            if not batch:
-                print(f"[apisports] empty batch page={page} url={url} params={params}")
             out.extend(_map_games(league, batch))
 
             if limit and len(out) >= limit:
@@ -163,6 +131,8 @@ class ApiSportsProvider:
         limit: Optional[int] = 500,
         soccer_league_id: Optional[int] = None,
     ) -> List[MarketBook]:
+        # Keep range support, but still “pass-through”: we only translate params,
+        # no year math beyond iterating seasons if both bounds are provided.
         base, path = _base_and_path(league)
         url = f"{base}/{path}"
         out: List[MarketBook] = []
@@ -177,6 +147,7 @@ class ApiSportsProvider:
             else:
                 if soccer_league_id:
                     params["league"] = str(soccer_league_id)
+
             if date_from:
                 params["from"] = date_from
             if date_to:
@@ -198,45 +169,31 @@ class ApiSportsProvider:
                 page += 1
             return out if not limit else out[:limit]
 
-        # Season window
-        if league in ("nba", "ncaab"):
-            # expand both ends for basketball
-            if season_from:
-                season_from = _expand_basketball_season(season_from)
-            if season_to:
-                season_to = _expand_basketball_season(season_to)
-        else:
-            if season_from:
-                season_from = _coerce_gridiron_season(season_from)
-            if season_to:
-                season_to = _coerce_gridiron_season(season_to)
-
+        # Season window (pass-through; if caller provides single year strings, we just send them)
         if season_from and not season_to:
             season_to = season_from
         if season_to and not season_from:
             season_from = season_to
 
         if season_from and season_to:
-            if league in ("nba", "ncaab"):
-                # Iterate start years but send expanded form
-                start_year = int(season_from.split("-")[0])
-                end_year = int(season_to.split("-")[0])
-                years = range(start_year, end_year + 1)
-            else:
-                years = range(int(season_from), int(season_to) + 1)
+            # iterate start -> end inclusive by simple integer if both look like numbers,
+            # otherwise just call once with season_from (keeps behavior predictable).
+            try:
+                start = int("".join(ch for ch in str(season_from) if ch.isdigit())[:4])
+                end   = int("".join(ch for ch in str(season_to)   if ch.isdigit())[:4])
+                seasons = [str(y) for y in range(start, end + 1)]
+            except Exception:
+                seasons = [str(season_from)]
 
-            for yr in years:
-                params: dict = {"timezone": "UTC"}
+            for s in seasons:
+                params: dict = {"timezone": "UTC", "season": s}
                 if league in ("nba", "ncaab"):
                     params["league"] = BASKETBALL_LEAGUE_ID[league]
-                    params["season"] = f"{yr}-{yr+1}"
                 elif league in ("nfl", "ncaaf"):
                     params["league"] = FOOTBALL_LEAGUE_ID[league]
-                    params["season"] = str(yr)
                 else:
                     if soccer_league_id:
                         params["league"] = str(soccer_league_id)
-                    params["season"] = str(yr)
 
                 page = 1
                 while True:
