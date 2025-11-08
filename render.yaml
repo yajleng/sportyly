@@ -1,1 +1,15 @@
 
+services:
+  - type: web
+    name: gpt-picks-api
+    runtime: python
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: APISPORTS_KEY
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
