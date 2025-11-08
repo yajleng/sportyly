@@ -1,17 +1,16 @@
 # app/api/v1/endpoints/vendor.py
-from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
-
+from typing import Optional
 from app.deps import provider_dep
 from app.core.config import settings
 
 router = APIRouter()
 
-@router.get("/vendor/games", summary="Fetch upcoming games via provider")
+@router.get("/vendor/games", summary="Fetch games (date or season; defaults to today UTC)")
 async def vendor_games(
     league: str = Query(..., pattern="^(nba|nfl|ncaaf|ncaab)$"),
     date: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    season: Optional[str] = Query(None, description="e.g., 2024-2025 for NBA, 2024 for NFL"),
+    season: Optional[str] = Query(None, description="NBA/NCAAB: '2024-2025' or '2024'; NFL/NCAAF: '2024'"),
     limit: Optional[int] = Query(25, ge=1, le=200),
     compact: bool = Query(False, description="Return only id, start, teams"),
     provider = Depends(provider_dep),
@@ -28,13 +27,51 @@ async def vendor_games(
                         "start_iso": b.game.start_iso,
                         "home": {"name": b.game.home.name, "abbr": b.game.home.abbr},
                         "away": {"name": b.game.away.name, "abbr": b.game.away.abbr},
-                    }
-                    for b in books
+                    } for b in books
                 ],
             }
         return {"league": league, "games": [b.game.model_dump() for b in books]}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"provider_error: {e}")
+
+@router.get("/vendor/games/history", summary="Fetch historical games by date window or season window")
+async def vendor_games_history(
+    league: str = Query(..., pattern="^(nba|nfl|ncaaf|ncaab)$"),
+    # either a date window...
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    # ...or a season window
+    season_from: Optional[str] = Query(None, description="NBA/NCAAB: '2024-2025' or '2024'; NFL/NCAAF: '2024'"),
+    season_to: Optional[str] = Query(None, description="Same format as season_from"),
+    limit: Optional[int] = Query(500, ge=1, le=2000),
+    compact: bool = Query(True, description="Return only id, start, teams (default true here)"),
+    provider = Depends(provider_dep),
+):
+    try:
+        books = await provider.list_games_range(
+            league,
+            date_from=date_from,
+            date_to=date_to,
+            season_from=season_from,
+            season_to=season_to,
+            limit=limit,
+        )
+        if compact:
+            return {
+                "league": league,
+                "count": len(books),
+                "games": [
+                    {
+                        "game_id": b.game.game_id,
+                        "start_iso": b.game.start_iso,
+                        "home": {"name": b.game.home.name, "abbr": b.game.home.abbr},
+                        "away": {"name": b.game.away.name, "abbr": b.game.away.abbr},
+                    } for b in books
+                ],
+            }
+        return {"league": league, "games": [b.game.model_dump() for b in books]}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"provider_error: {e}")        
 
 @router.get("/vendor/provider", summary="Show which provider is active (key masked)")
 async def vendor_provider():
