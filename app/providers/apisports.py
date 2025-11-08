@@ -1,41 +1,65 @@
+# app/providers/apisports.py
 import os
-from typing import Iterable, Literal
+from typing import Optional, Literal, List
 import httpx
 
-from app.domain.models import Game, Team, Price, Line, MarketBook
+from app.domain.models import Game, Team, MarketBook
 
-League = Literal["nba","nfl","ncaaf","ncaab"]
+League = Literal["nba", "nfl", "ncaaf", "ncaab"]
 
+# Base URLs (override with env on Render)
 FOOTBALL_BASE = os.getenv("APISPORTS_BASE_FOOTBALL", "https://v3.football.api-sports.io")
 BASKETBALL_BASE = os.getenv("APISPORTS_BASE_BASKETBALL", "https://v1.basketball.api-sports.io")
 
+# API-SPORTS league ids (adjust if you use others)
+LEAGUE_ID = {
+    "nba": "12",    # Basketball
+    "ncaab": "7",   # NCAA Basketball
+    "nfl": "1",     # Football
+    "ncaaf": "2",   # NCAA Football
+}
+
 class ApiSportsProvider:
+    """
+    Minimal API-SPORTS adapter that fetches game schedules and normalizes them
+    to your domain models. Returns a List[MarketBook].
+    """
     def __init__(self, key: str):
         self.key = key
         self.client = httpx.AsyncClient(timeout=15)
 
     def _headers(self) -> dict:
+        # Direct API-SPORTS header (not RapidAPI)
         return {"x-apisports-key": self.key}
 
-    async def list_games(self, league: League) -> Iterable[MarketBook]:
-        # Pick a basic "games/fixtures" endpoint per sport. Fill league/season
-        # with the ones you actually want later.
+    async def list_games(
+        self,
+        league: League,
+        *,
+        date: Optional[str] = None,     # "YYYY-MM-DD"
+        season: Optional[str] = None,   # NBA "2024-2025", NFL "2024", etc.
+        limit: Optional[int] = None,
+    ) -> List[MarketBook]:
         if league in ("nba", "ncaab"):
             base = BASKETBALL_BASE
             url = f"{base}/games"
-            params = {"league": "12" if league == "nba" else "7", "season": "2024-2025"}
         else:
             base = FOOTBALL_BASE
             url = f"{base}/fixtures"
-            params = {"league": "1" if league == "nfl" else "2", "season": "2024"}  # adjust
+
+        params: dict = {"league": LEAGUE_ID[league]}
+        if date:
+            params["date"] = date
+        if season:
+            params["season"] = season
 
         r = await self.client.get(url, headers=self._headers(), params=params)
         r.raise_for_status()
         data = r.json().get("response", [])
 
-        out: list[MarketBook] = []
+        out: List[MarketBook] = []
         for g in data:
-            # Map common fields defensively across sports
+            # Defensive extraction across sports
             gid = str(
                 g.get("id")
                 or g.get("fixture", {}).get("id")
@@ -62,6 +86,13 @@ class ApiSportsProvider:
                 home=Team(id=f"{gid}-H", name=home_name, abbr=home_abbr),
                 away=Team(id=f"{gid}-A", name=away_name, abbr=away_abbr),
             )
-            # Odds/lines come later (separate endpoints)
+
             out.append(MarketBook(game=game, lines=[]))
+
+            if limit and len(out) >= limit:
+                break
+
         return out
+
+    async def aclose(self):
+        await self.client.aclose()
