@@ -1,30 +1,114 @@
 import os
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Dict, Any
 from datetime import datetime, timezone
 import httpx
 
 from app.domain.models import Game, Team, MarketBook
 
-League = Literal["nba", "ncaab", "nfl", "ncaaf", "soccer"]
+League = Literal["nba", "nfl", "ncaaf", "ncaab", "soccer"]
 
-# Correct bases per API-SPORTS products
+FOOTBALL_BASE   = os.getenv("APISPORTS_BASE_FOOTBALL",   "https://v3.football.api-sports.io")
 BASKETBALL_BASE = os.getenv("APISPORTS_BASE_BASKETBALL", "https://v1.basketball.api-sports.io")
-AMERICAN_FB_BASE = os.getenv("APISPORTS_BASE_AMERICAN_FB", "https://v1.american-football.api-sports.io")
-SOCCER_BASE = os.getenv("APISPORTS_BASE_SOCCER", "https://v3.football.api-sports.io")  # association football
 
-# League ids per API-SPORTS (these are the common defaults)
-BASKETBALL_LEAGUE_ID = {"nba": "12", "ncaab": "7"}
-AMERICAN_FB_LEAGUE_ID = {"nfl": "1", "ncaaf": "2"}  # API-Sports American Football product
+LEAGUE_ID = {
+    "nba": "12",    # Basketball
+    "ncaab": "7",   # NCAA Basketball
+    "nfl": "1",     # American Football
+    "ncaaf": "2",   # NCAA Football
+    # soccer uses many competitions -> pass in via soccer_league_id
+}
 
-def _normalize_season_for_basketball(season: Optional[str]) -> Optional[str]:
-    """NBA/NCAAB: they accept starting year (e.g., '2024') even if caller sends '2024-2025'."""
-    if not season:
+def _normalize_basketball_season(value: Optional[str]) -> Optional[str]:
+    """
+    API-SPORTS Basketball expects '2024-2025'.
+    If the caller sends '2024', convert to '2024-2025'.
+    Otherwise pass-through.
+    """
+    if not value:
         return None
-    s = str(season)
+    s = str(value)
     if "-" in s:
-        s = s.split("-")[0]
-    digits = "".join(ch for ch in s if ch.isdigit())
-    return digits or None
+        return s
+    # single year -> make a span
+    try:
+        y = int(s)
+        return f"{y}-{y+1}"
+    except Exception:
+        return s
+
+def _pick_start_iso(g: Dict[str, Any]) -> str:
+    """
+    Robust date picker:
+    - Prefer plain 'date' if it's already a string
+    - Else look into 'fixture.date' or 'game.date'
+    - If any of those is a dict like {'date': '...', 'timezone': 'UTC', ...},
+      extract the 'date' field.
+    """
+    # top-level 'date'
+    d = g.get("date")
+    if isinstance(d, str):
+        return d
+    if isinstance(d, dict) and isinstance(d.get("date"), str):
+        return d["date"]
+
+    # fixture.date
+    fx = g.get("fixture")
+    if isinstance(fx, dict):
+        d = fx.get("date")
+        if isinstance(d, str):
+            return d
+        if isinstance(d, dict) and isinstance(d.get("date"), str):
+            return d["date"]
+
+    # game.date
+    gm = g.get("game")
+    if isinstance(gm, dict):
+        d = gm.get("date")
+        if isinstance(d, str):
+            return d
+        if isinstance(d, dict) and isinstance(d.get("date"), str):
+            return d["date"]
+
+    return ""
+
+def _map_games(league: League, data: list) -> List[MarketBook]:
+    out: List[MarketBook] = []
+    for g in data:
+        gid = str(
+            g.get("id")
+            or (g.get("fixture") or {}).get("id")
+            or (g.get("game") or {}).get("id")
+            or "unknown"
+        )
+
+        start_iso = _pick_start_iso(g)
+
+        # teams
+        home = (g.get("teams") or {}).get("home") or g.get("home") or {}
+        away = (g.get("teams") or {}).get("away") or g.get("away") or {}
+
+        home_name = home.get("name") or "Home"
+        away_name = away.get("name") or "Away"
+        home_abbr = home.get("code") or home.get("abbr") or "HOME"
+        away_abbr = away.get("code") or away.get("abbr") or "AWY"
+
+        game = Game(
+            game_id=gid,
+            league=league,
+            start_iso=start_iso,  # always a string now
+            home=Team(id=f"{gid}-H", name=home_name, abbr=home_abbr),
+            away=Team(id=f"{gid}-A", name=away_name, abbr=away_abbr),
+        )
+        out.append(MarketBook(game=game, lines=[]))
+    return out
+
+def _base_and_path(league: League) -> tuple[str, str]:
+    if league in ("nba", "ncaab"):
+        return BASKETBALL_BASE, "games"
+    if league in ("nfl", "ncaaf"):
+        return FOOTBALL_BASE, "fixtures"
+    # soccer (football/soccer) lives on the football host too
+    return FOOTBALL_BASE, "fixtures"
 
 class ApiSportsProvider:
     def __init__(self, key: str):
@@ -38,58 +122,57 @@ class ApiSportsProvider:
         self,
         league: League,
         *,
-        date: Optional[str] = None,      # YYYY-MM-DD
-        season: Optional[str] = None,    # NBA/NCAAB: '2024' or '2024-2025'; NFL/NCAAF/Soccer: '2024'
+        date: Optional[str] = None,        # YYYY-MM-DD
+        season: Optional[str] = None,      # nba/ncaab "2024-2025" (or "2024"), nfl/ncaaf "2024", soccer "2024"
         limit: Optional[int] = None,
         soccer_league_id: Optional[int] = None,
     ) -> List[MarketBook]:
-        """
-        Single-page convenience fetch; defaults to today's UTC date if no filter is supplied.
-        """
-        # Route by sport family
-        if league in ("nba", "ncaab"):
-            base, path = BASKETBALL_BASE, "games"
-            params = {
-                "league": BASKETBALL_LEAGUE_ID[league],
-                "timezone": "UTC",
-            }
-            if date:
-                params["date"] = date
-            norm = _normalize_season_for_basketball(season)
-            if norm:
-                params["season"] = norm
-        elif league in ("nfl", "ncaaf"):
-            base, path = AMERICAN_FB_BASE, "games"
-            params = {
-                "league": AMERICAN_FB_LEAGUE_ID[league],
-                "timezone": "UTC",
-            }
-            if date:
-                params["date"] = date
-            if season:
-                params["season"] = season  # American football uses single year (e.g., 2024)
-        else:  # soccer
-            base, path = SOCCER_BASE, "fixtures"
-            if not soccer_league_id:
-                # Require explicit soccer competition to avoid huge pulls
-                return []
-            params = {"league": str(soccer_league_id), "timezone": "UTC"}
-            if date:
-                params["date"] = date
-            if season:
-                params["season"] = season
+        base, path = _base_and_path(league)
+        url = f"{base}/{path}"
 
-        # Fallback: keep payload small if caller sends no filter
-        if "date" not in params and "season" not in params:
+        params: Dict[str, Any] = {"timezone": "UTC"}
+
+        if league == "soccer":
+            # soccer requires an explicit competition id
+            if soccer_league_id is None:
+                return []
+            params["league"] = str(soccer_league_id)
+        else:
+            params["league"] = LEAGUE_ID[league]
+
+        # season handling
+        if league in ("nba", "ncaab"):
+            season = _normalize_basketball_season(season)
+        if season:
+            params["season"] = season
+
+        if date:
+            params["date"] = date
+
+        # default to today if neither season nor date was provided
+        if "season" not in params and "date" not in params:
             params["date"] = datetime.now(timezone.utc).date().isoformat()
 
-        url = f"{base}/{path}"
-        r = await self.client.get(url, headers=self._headers(), params=params)
-        r.raise_for_status()
-        body = r.json()
-        data = body.get("response", [])
+        out: List[MarketBook] = []
+        page = 1
+        while True:
+            params["page"] = page
+            r = await self.client.get(url, headers=self._headers(), params=params)
+            r.raise_for_status()
+            body = r.json()
+            data = body.get("response", [])
+            paging = body.get("paging", {})
 
-        out: List[MarketBook] = _map_games(league, data)
+            out.extend(_map_games(league, data))
+            if limit and len(out) >= limit:
+                return out[:limit]
+
+            cur = int(paging.get("current", page) or page)
+            tot = int(paging.get("total", page) or page)
+            if cur >= tot or not data:
+                break
+            page += 1
+
         return out[:limit] if limit else out
 
     async def list_games_range(
@@ -103,31 +186,25 @@ class ApiSportsProvider:
         limit: Optional[int] = 500,
         soccer_league_id: Optional[int] = None,
     ) -> List[MarketBook]:
-        """
-        Paged fetch across a date or season window. Handles API pagination internally.
-        """
-        if league in ("nba", "ncaab"):
-            base, path = BASKETBALL_BASE, "games"
-            league_id = BASKETBALL_LEAGUE_ID[league]
-        elif league in ("nfl", "ncaaf"):
-            base, path = AMERICAN_FB_BASE, "games"
-            league_id = AMERICAN_FB_LEAGUE_ID[league]
-        else:
-            base, path = SOCCER_BASE, "fixtures"
-            if not soccer_league_id:
-                return []
-            league_id = str(soccer_league_id)
-
+        base, path = _base_and_path(league)
         url = f"{base}/{path}"
+
         out: List[MarketBook] = []
 
-        # Strategy 1: date window (supported across products)
+        # DATE WINDOW (works for football, basketball, soccer)
         if date_from or date_to:
-            params = {"league": league_id, "timezone": "UTC"}
+            params: Dict[str, Any] = {"timezone": "UTC"}
+            if league == "soccer":
+                if soccer_league_id is None:
+                    return []
+                params["league"] = str(soccer_league_id)
+            else:
+                params["league"] = LEAGUE_ID[league]
             if date_from:
                 params["from"] = date_from
             if date_to:
                 params["to"] = date_to
+
             page = 1
             while True:
                 params["page"] = page
@@ -135,81 +212,26 @@ class ApiSportsProvider:
                 r.raise_for_status()
                 body = r.json()
                 data = body.get("response", [])
+                paging = body.get("paging", {})
+
                 out.extend(_map_games(league, data))
                 if limit and len(out) >= limit:
                     return out[:limit]
-                paging = body.get("paging", {})
-                cur = int(paging.get("current", page))
-                tot = int(paging.get("total", page))
+
+                cur = int(paging.get("current", page) or page)
+                tot = int(paging.get("total", page) or page)
                 if cur >= tot or not data:
                     break
                 page += 1
             return out[:limit] if limit else out
 
-        # Strategy 2: season window (iterate seasons)
-        s_from = _normalize_season_for_basketball(season_from) if league in ("nba", "ncaab") else season_from
-        s_to = _normalize_season_for_basketball(season_to) if league in ("nba", "ncaab") else season_to
+        # SEASON WINDOW (iterate seasons)
+        s_from = season_from
+        s_to   = season_to
+        if league in ("nba", "ncaab"):
+            s_from = _normalize_basketball_season(season_from)
+            s_to   = _normalize_basketball_season(season_to)
+
         if s_from and not s_to:
             s_to = s_from
-        if s_to and not s_from:
-            s_from = s_to
-
-        if s_from and s_to:
-            for yr in range(int(s_from), int(s_to) + 1):
-                params = {"league": league_id, "season": str(yr), "timezone": "UTC"}
-                page = 1
-                while True:
-                    params["page"] = page
-                    r = await self.client.get(url, headers=self._headers(), params=params)
-                    r.raise_for_status()
-                    body = r.json()
-                    data = body.get("response", [])
-                    out.extend(_map_games(league, data))
-                    if limit and len(out) >= limit:
-                        return out[:limit]
-                    paging = body.get("paging", {})
-                    cur = int(paging.get("current", page))
-                    tot = int(paging.get("total", page))
-                    if cur >= tot or not data:
-                        break
-                    page += 1
-
-        # If no filters, fall back to today
-        if not (date_from or date_to or s_from or s_to):
-            return await self.list_games(league, limit=limit, soccer_league_id=soccer_league_id)
-
-        return out[:limit] if limit else out
-
-    async def aclose(self):
-        await self.client.aclose()
-
-def _map_games(league: League, data: list) -> List[MarketBook]:
-    out: List[MarketBook] = []
-    for g in data:
-        gid = str(
-            g.get("id")
-            or g.get("fixture", {}).get("id")
-            or g.get("game", {}).get("id")
-            or "unknown"
-        )
-        start_iso = (
-            g.get("date")
-            or g.get("fixture", {}).get("date")
-            or g.get("game", {}).get("date")
-            or ""
-        )
-        home = g.get("teams", {}).get("home") or g.get("home", {})
-        away = g.get("teams", {}).get("away") or g.get("away", {})
-        home_name = home.get("name", "Home")
-        away_name = away.get("name", "Away")
-        home_abbr = home.get("code", "HOME")
-        away_abbr = away.get("code", "AWY")
-        game = Game(
-            game_id=gid,
-            league=league,
-            start_iso=start_iso,
-            home=Team(id=f"{gid}-H", name=home_name, abbr=home_abbr),
-            away=Team(id=f"{gid}-A", name=away_name, abbr=away_abbr),
-        )
-        out.append(MarketBook(game=game, lines=[]))
-    return out
+        if s
