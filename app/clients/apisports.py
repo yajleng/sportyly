@@ -1,121 +1,162 @@
+# app/clients/apisports.py
+from __future__ import annotations
 
 import httpx
-from typing import Any, Dict, Optional, Literal
+from typing import Any, Dict, Optional
 
-League = Literal["nba", "nfl", "ncaaf", "ncaab", "soccer"]
-
-# Base URLs vary by sport. Keep them centralized & easy to swap if API changes.
-BASES: Dict[League, str] = {
-    # Basketball (NBA, NCAAB) – API-SPORTS uses v1 for basketball
-    "nba":    "https://v1.basketball.api-sports.io",
-    "ncaab":  "https://v1.basketball.api-sports.io",
-    # American Football – NFL/NCAAF (v1)
-    "nfl":    "https://v1.american-football.api-sports.io",
-    "ncaaf":  "https://v1.american-football.api-sports.io",
-    # Soccer/Football (v3)
-    "soccer": "https://v3.football.api-sports.io",
-}
-
-# League identifiers used by API-SPORTS (edit if your account uses different IDs)
-LEAGUE_IDS: Dict[League, int] = {
-    "nba": 12,       # Basketball NBA
-    "ncaab": 7,      # Basketball NCAA
-    "nfl": 1,        # American Football NFL
-    "ncaaf": 2,      # American Football NCAAF
-    # Soccer requires also a country/season in queries; league id example: EPL=39, MLS=253, UCL=2, etc.
-    # You can pass a `league_id` override at call-time for soccer.
-    "soccer": 39,
-}
+from app.core.config import (
+    League,                 # Literal["nba","nfl","ncaaf","ncaab","soccer"]
+    get_base_for_league,    # returns base URL per league family
+    get_league_id,          # returns default league id (or override)
+)
 
 class ApiSportsClient:
-    def __init__(self, api_key: str, timeout: float = 15.0):
-        self.api_key = api_key
-        self.timeout = timeout
-        self._client = httpx.Client(timeout=timeout, headers={"x-apisports-key": api_key})
+    def __init__(self, api_key: str, timeout: float = 20.0):
+        self._client = httpx.Client(
+            timeout=timeout,
+            headers={"x-apisports-key": api_key},
+        )
 
-    def _base(self, league: League) -> str:
-        return BASES[league]
-
+    # ---------- internal ----------
     def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        r = self._client.get(url, params=params)
+        r = self._client.get(url, params=params or {})
         r.raise_for_status()
         return r.json()
 
-    # ---- Common calls ----
-    def fixtures_by_date(self, league: League, date: str, season: Optional[int] = None,
-                         league_id: Optional[int] = None, **kw) -> Dict[str, Any]:
-        base = self._base(league)
-        lid = league_id or LEAGUE_IDS[league]
-        if league == "soccer":
+    def _is_soccer(self, league: League) -> bool:
+        return league == "soccer"
+
+    # ---------- core calls ----------
+    def fixtures_by_date(
+        self,
+        league: League,
+        date: str,                     # "YYYY-MM-DD"
+        season: Optional[int] = None,
+        league_id: Optional[int] = None,
+        **kw: Any,
+    ) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        lid = get_league_id(league, league_id)
+        if self._is_soccer(league):
             url = f"{base}/fixtures"
-            params = {"league": lid, "date": date}
-            if season: params["season"] = season
-        elif league in ("nba", "ncaab"):
+            params: Dict[str, Any] = {"league": lid, "date": date}
+            if season is not None:
+                params["season"] = season
+        else:
             url = f"{base}/games"
             params = {"league": lid, "date": date}
-            if season: params["season"] = season
-        else:  # nfl, ncaaf
-            url = f"{base}/games"
-            params = {"league": lid, "date": date}
-            if season: params["season"] = season
-        params.update(kw)
+            if season is not None:
+                params["season"] = season
+        params.update({k: v for k, v in (kw or {}).items() if v is not None})
         return self._get(url, params)
 
-    def odds_for_fixture(self, league: League, fixture_id: int, **kw) -> Dict[str, Any]:
-        base = self._base(league)
-        if league == "soccer":
+    def fixtures_range(
+        self,
+        league: League,
+        from_date: str,                # "YYYY-MM-DD"
+        to_date: str,                  # "YYYY-MM-DD"
+        season: Optional[int] = None,
+        league_id: Optional[int] = None,
+        **kw: Any,
+    ) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        lid = get_league_id(league, league_id)
+        if self._is_soccer(league):
+            url = f"{base}/fixtures"
+            params: Dict[str, Any] = {"league": lid, "from": from_date, "to": to_date}
+            if season is not None:
+                params["season"] = season
+        else:
+            url = f"{base}/games"
+            params = {"league": lid, "from": from_date, "to": to_date}
+            if season is not None:
+                params["season"] = season
+        params.update({k: v for k, v in (kw or {}).items() if v is not None})
+        return self._get(url, params)
+
+    def odds_for_fixture(
+        self,
+        league: League,
+        fixture_id: int,
+        **kw: Any,
+    ) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        if self._is_soccer(league):
             url = f"{base}/odds"
-            params = {"fixture": fixture_id}
+            params: Dict[str, Any] = {"fixture": fixture_id}
         else:
             url = f"{base}/odds"
             params = {"game": fixture_id}
-        params.update(kw)
+        params.update({k: v for k, v in (kw or {}).items() if v is not None})
         return self._get(url, params)
 
-    def standings(self, league: League, season: int, league_id: Optional[int] = None) -> Dict[str, Any]:
-        base = self._base(league)
-        lid = league_id or LEAGUE_IDS[league]
-        if league == "soccer":
-            return self._get(f"{base}/standings", {"league": lid, "season": season})
-        else:
-            return self._get(f"{base}/standings", {"league": lid, "season": season})
+    def odds_bookmakers(self, league: League) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        return self._get(f"{base}/odds/bookmakers", {})
 
-    def teams_stats(self, league: League, season: int, team_id: Optional[int] = None,
-                    league_id: Optional[int] = None) -> Dict[str, Any]:
-        base = self._base(league)
-        lid = league_id or LEAGUE_IDS[league]
-        params = {"league": lid, "season": season}
-        if team_id: params["team"] = team_id
-        if league == "soccer":
-            url = f"{base}/teams/statistics"
-        else:
-            url = f"{base}/teams/statistics"
-        return self._get(url, params)
+    def standings(
+        self,
+        league: League,
+        season: int,
+        league_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        lid = get_league_id(league, league_id)
+        return self._get(f"{base}/standings", {"league": lid, "season": season})
 
-    def players_stats(self, league: League, season: int, team_id: Optional[int] = None,
-                      player_id: Optional[int] = None, page: int = 1, **kw) -> Dict[str, Any]:
-        base = self._base(league)
-        if league == "soccer":
-            url = f"{base}/players"
-            params = {"season": season, "team": team_id, "page": page}
-        else:
-            url = f"{base}/players"
-            params = {"season": season, "team": team_id, "page": page}
-        params.update({k: v for k, v in kw.items() if v is not None})
-        return self._get(url, params)
+    def teams_stats(
+        self,
+        league: League,
+        season: int,
+        team_id: Optional[int] = None,
+        league_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        lid = get_league_id(league, league_id)
+        params: Dict[str, Any] = {"league": lid, "season": season}
+        if team_id is not None:
+            params["team"] = team_id
+        return self._get(f"{base}/teams/statistics", params)
 
-    # Historical fixtures/odds — pass past dates/seasons
-    def fixtures_range(self, league: League, from_date: str, to_date: str, season: Optional[int] = None,
-                       league_id: Optional[int] = None, **kw) -> Dict[str, Any]:
-        base = self._base(league)
-        lid = league_id or LEAGUE_IDS[league]
-        if league == "soccer":
-            url = f"{base}/fixtures"
-            params = {"league": lid, "from": from_date, "to": to_date}
-            if season: params["season"] = season
-        else:
-            url = f"{base}/games"
-            params = {"league": lid, "from": from_date, "to": to_date}
-            if season: params["season"] = season
-        params.update(kw)
-        return self._get(url, params)
+    def players_stats(
+        self,
+        league: League,
+        season: int,
+        team_id: Optional[int] = None,
+        page: int = 1,
+        league_id: Optional[int] = None,
+        **kw: Any,
+    ) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        lid = get_league_id(league, league_id)
+        params: Dict[str, Any] = {"league": lid, "season": season, "page": page}
+        if team_id is not None:
+            params["team"] = team_id
+        params.update({k: v for k, v in (kw or {}).items() if v is not None})
+        return self._get(f"{base}/players", params)
+
+    def injuries(
+        self,
+        league: League,
+        date: Optional[str] = None,            # "YYYY-MM-DD"
+        league_id: Optional[int] = None,
+        **kw: Any,
+    ) -> Dict[str, Any]:
+        base = get_base_for_league(league)
+        params: Dict[str, Any] = {}
+        if league_id is not None:
+            params["league"] = league_id
+        if date is not None:
+            params["date"] = date
+        params.update({k: v for k, v in (kw or {}).items() if v is not None})
+        return self._get(f"{base}/injuries", params)
+
+    # ---------- lifecycle ----------
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "ApiSportsClient":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
