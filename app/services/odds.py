@@ -109,4 +109,79 @@ def _normalize_ml(m: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
         return None
     return out
 
-def _normalize_spread(m: Dict[str, Any]) -> Optional[Dict[str,]()]()
+def _normalize_spread(m: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
+    if not m:
+        return None
+    out: Dict[str, Optional[float]] = {"home_line": None, "home_price": None, "away_line": None, "away_price": None}
+    for o in _iter_outcomes(m):
+        name = (o.get("name") or o.get("label") or "").lower()
+        p = _extract_price(o)
+        h = _extract_handicap(o)
+        if "home" in name or name in ("1", "team 1"):
+            out["home_line"], out["home_price"] = h, p
+        elif "away" in name or name in ("2", "team 2"):
+            out["away_line"], out["away_price"] = h, p
+    if all(v is None for v in out.values()):
+        return None
+    return out
+
+def _normalize_total(m: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
+    if not m:
+        return None
+    out: Dict[str, Optional[float]] = {"total": None, "over_price": None, "under_price": None}
+    for o in _iter_outcomes(m):
+        name = (o.get("name") or o.get("label") or "").lower()
+        p = _extract_price(o)
+        h = _extract_handicap(o)
+        if "over" in name:
+            out["total"] = out["total"] if out["total"] is not None else h
+            out["over_price"] = p
+        elif "under" in name:
+            out["total"] = out["total"] if out["total"] is not None else h
+            out["under_price"] = p
+    if all(v is None for v in out.values()):
+        return None
+    return out
+
+def normalize_odds(odds_payload: Dict[str, Any]) -> NormalizedOdds:
+    """
+    Returns:
+    {
+      "moneyline": {"home_price": -120, "away_price": +105, "draw_price": +260?},
+      "spread": {"home_line": -3.5, "home_price": -110, "away_line": +3.5, "away_price": -110},
+      "total": {"total": 224.5, "over_price": -110, "under_price": -110},
+      "half_total": {...} | None,
+      "quarter_total": {...} | None
+    }
+    Missing markets => None.
+    """
+    book = _first_book(odds_payload)
+    if not book:
+        return {
+            "moneyline": None,
+            "spread": None,
+            "total": None,
+            "half_total": None,
+            "quarter_total": None,
+        }
+
+    # Map likely market names for each target
+    ml = _find_market(book, ["moneyline", "match winner", "winner"])
+    sp = _find_market(book, ["spread", "handicap"])
+    tot = _find_market(book, ["total", "over/under", "over under"])
+
+    # Period markets (will exist only when book provides them)
+    htot = _find_market(book, [
+        "1st half total", "first half total", "half - total", "half total", "1h total"
+    ])
+    qtot = _find_market(book, [
+        "1st quarter total", "first quarter total", "quarter total", "1q total"
+    ])
+
+    return {
+        "moneyline": _normalize_ml(ml),
+        "spread": _normalize_spread(sp),
+        "total": _normalize_total(tot),
+        "half_total": _normalize_total(htot),
+        "quarter_total": _normalize_total(qtot),
+    }
