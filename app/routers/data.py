@@ -108,3 +108,19 @@ def history(
 
     finally:
         client.close()
+
+@router.get("/odds")
+def odds(
+    league: League,
+    fixture_id: int,
+    raw: bool = False,
+):
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+    client = ApiSportsClient(api_key=settings.apisports_key)
+    try:
+        payload = client.odds_for_fixture(league, fixture_id)
+        return payload if raw else {"fixture_id": fixture_id, "odds": normalize_odds(payload)}
+    finally:
+        client.close()
