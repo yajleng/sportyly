@@ -10,9 +10,11 @@ from ..services.odds import normalize_odds
 
 router = APIRouter(prefix="/data", tags=["data"])
 
+
 def _client() -> ApiSportsClient:
     settings = get_settings()
     return ApiSportsClient(api_key=settings.apisports_key)
+
 
 # ---------------- Injuries (unified across sports) ----------------
 @router.get(
@@ -40,29 +42,13 @@ def injuries(
     team: Optional[int] = Query(None, description="Team ID (required for NFL/NCAAF if player not given)", example=15),
     player: Optional[int] = Query(None, description="Player ID (required for NFL/NCAAF if team not given)", example=53),
 ):
-    """
-    Unified injuries gateway (see description for per-league rules).
-    """
-    # Validate per-league requirements
+    # Per-league validation
     if league in ("nba", "ncaab"):
-        raise HTTPException(
-            status_code=501,
-            detail="Injuries are not provided for NBA/NCAAB by API-SPORTS."
-        )
-
-    if league in ("nfl", "ncaaf"):
-        if not team and not player:
-            raise HTTPException(
-                status_code=422,
-                detail="NFL/NCAAF injuries require at least one of: team or player."
-            )
-
-    if league == "soccer":
-        if not league_id_override or not season:
-            raise HTTPException(
-                status_code=422,
-                detail="Soccer injuries require league_id_override (competition) and season."
-            )
+        raise HTTPException(status_code=501, detail="Injuries are not provided for NBA/NCAAB by API-SPORTS.")
+    if league in ("nfl", "ncaaf") and not (team or player):
+        raise HTTPException(status_code=422, detail="NFL/NCAAF injuries require at least one of: team or player.")
+    if league == "soccer" and not (league_id_override and season):
+        raise HTTPException(status_code=422, detail="Soccer injuries require league_id_override (competition) and season.")
 
     settings = get_settings()
     if not settings.apisports_key:
@@ -77,13 +63,11 @@ def injuries(
             kwargs["player"] = player
 
         if league == "soccer":
-            # soccer needs league + season (client maps league_id -> 'league' on wire)
             return client.injuries(league, league_id=league_id_override, season=season, **kwargs)
-
-        # american-football: just pass team/player (no season needed)
         return client.injuries(league, **kwargs)
     finally:
         client.close()
+
 
 # ---------------- History (with optional odds) ----------------
 @router.get("/history")
@@ -94,11 +78,12 @@ def history(
     season: Optional[int] = None,
     include_odds: bool = False,
     league_id_override: Optional[int] = None,
+    bookmaker_id: Optional[int] = Query(None, description="Prefer odds from this bookmaker id"),
     max_odds_lookups: int = 200,     # safety to avoid rate limits
 ):
     """
     Returns fixtures between dates with final scores.
-    If include_odds=true, attaches normalized ML/Spread/Total markets (best-effort, first bookmaker).
+    If include_odds=true, attaches normalized ML/Spread/Total markets.
     """
     settings = get_settings()
     if not settings.apisports_key:
@@ -151,7 +136,7 @@ def history(
             if include_odds and lookups < max_odds_lookups and fid:
                 try:
                     odds_raw = client.odds_for_fixture(league, int(fid))
-                    row["odds"] = normalize_odds(odds_raw)
+                    row["odds"] = normalize_odds(odds_raw, preferred_bookmaker_id=bookmaker_id)
                     lookups += 1
                 except Exception:
                     row["odds"] = None
@@ -159,9 +144,9 @@ def history(
             out.append(row)
 
         return {"count": len(out), "league": league, "range": [start_date, end_date], "items": out}
-
     finally:
         client.close()
+
 
 # ---------------- Odds (raw or normalized) ----------------
 @router.get(
@@ -180,6 +165,7 @@ def odds(
     league: League,
     fixture_id: int,
     raw: bool = False,
+    bookmaker_id: Optional[int] = Query(None, description="Prefer odds from this bookmaker id"),
 ):
     settings = get_settings()
     if not settings.apisports_key:
@@ -187,6 +173,9 @@ def odds(
     client = _client()
     try:
         payload = client.odds_for_fixture(league, fixture_id)
-        return payload if raw else {"fixture_id": fixture_id, "odds": normalize_odds(payload)}
+        return payload if raw else {
+            "fixture_id": fixture_id,
+            "odds": normalize_odds(payload, preferred_bookmaker_id=bookmaker_id),
+        }
     finally:
         client.close()
