@@ -7,6 +7,7 @@ from fastapi import APIRouter, Query, HTTPException
 from ..clients.apisports import ApiSportsClient, League
 from ..core.config import get_settings
 from ..services.odds import normalize_odds
+from ..services.resolve import resolve_fixture_id
 
 router = APIRouter(prefix="/data", tags=["data"])
 
@@ -65,6 +66,39 @@ def injuries(
         if league == "soccer":
             return client.injuries(league, league_id=league_id_override, season=season, **kwargs)
         return client.injuries(league, **kwargs)
+    finally:
+        client.close()
+
+
+# ---------------- Resolve: turn (teams/date) into fixture_id ----------------
+@router.get(
+    "/resolve",
+    summary="Resolve a fixture/game id by teams and date",
+    description=(
+        "Give me `(league, date, home, away)` and I'll return the most likely fixture/game id "
+        "plus a short candidate list.\n\n"
+        "For soccer you can optionally pass `league_id_override` and `season` if you're not using EPL=39."
+    ),
+)
+def resolve_endpoint(
+    league: League,
+    date: str,
+    home: Optional[str] = None,
+    away: Optional[str] = None,
+    league_id_override: Optional[int] = None,
+    season: Optional[int] = None,
+):
+    client = _client()
+    try:
+        return resolve_fixture_id(
+            client,
+            league=league,
+            date=date,
+            home=home,
+            away=away,
+            league_id_override=league_id_override,
+            season=season,
+        )
     finally:
         client.close()
 
@@ -148,33 +182,29 @@ def history(
         client.close()
 
 
-# ---------------- Odds (raw or normalized) ----------------
+# ---------------- Odds (auto-resolve when fixture_id not supplied) ----------------
 @router.get(
     "/odds",
     summary="Fixture/game odds (raw or normalized)",
     description=(
-        "Fetch bookmaker odds for a fixture (soccer) or game (american-football).\n\n"
-        "- **soccer** (API-Football v3): pass the *fixture id* (`fixture_id=`).\n"
-        "- **nfl/ncaaf** (american-football v1): pass the *game id* (`fixture_id=` maps to `game` on the provider).\n"
+        "Pass a `fixture_id` (soccer fixture / AF game id) **or** give `date + home + away` and I will resolve the id first.\n\n"
         "Optional filters:\n"
         "- `bookmaker_id` → provider `bookmaker`\n"
-        "- `bet_id` → provider `bet`\n\n"
-        "**Examples:**\n"
-        "- Soccer normalized: `/data/odds?league=soccer&fixture_id=1378969`\n"
-        "- Soccer raw: `/data/odds?league=soccer&fixture_id=1378969&raw=true`\n"
-        "- NFL by game + bookmaker: `/data/odds?league=nfl&fixture_id=7532&bookmaker_id=6`\n"
+        "- `bet_id` → provider `bet`"
     ),
 )
 def odds(
     league: League,
-    fixture_id: int,
+    fixture_id: Optional[int] = Query(None, description="Soccer fixture id or American-football game id"),
     raw: bool = False,
-    bookmaker_id: Optional[int] = Query(
-        None, description="Prefer odds from this bookmaker id (provider param: bookmaker)"
-    ),
-    bet_id: Optional[int] = Query(
-        None, description="Filter to a specific bet/market id (provider param: bet)"
-    ),
+    bookmaker_id: Optional[int] = Query(None, description="Prefer odds from this bookmaker id"),
+    bet_id: Optional[int] = Query(None, description="Filter to a specific bet/market id"),
+    # auto-resolve inputs:
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (use with home/away if fixture_id not given)"),
+    home: Optional[str] = None,
+    away: Optional[str] = None,
+    league_id_override: Optional[int] = None,
+    season: Optional[int] = None,
 ):
     settings = get_settings()
     if not settings.apisports_key:
@@ -182,16 +212,42 @@ def odds(
 
     client = _client()
     try:
-        # Pass optional filters straight through — our client forwards unknown kwargs.
+        # Resolve if needed
+        resolved_reason = None
+        if fixture_id is None:
+            if not date or not (home or away):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide fixture_id OR (date and at least one of home/away) for auto-resolve."
+                )
+            res = resolve_fixture_id(
+                client,
+                league=league,
+                date=date,
+                home=home,
+                away=away,
+                league_id_override=league_id_override,
+                season=season,
+            )
+            fixture_id = res.get("fixture_id")
+            resolved_reason = res.get("picked_reason")
+            if not fixture_id:
+                # surface candidates to the caller (your GPT can confirm with the user)
+                raise HTTPException(status_code=409, detail={
+                    "message": "Could not confidently resolve fixture; please confirm one of the candidates.",
+                    "candidates": res.get("candidates", []),
+                })
+
         extra: dict = {}
         if bookmaker_id is not None:
             extra["bookmaker"] = bookmaker_id
         if bet_id is not None:
             extra["bet"] = bet_id
 
-        payload = client.odds_for_fixture(league, fixture_id, **extra)
+        payload = client.odds_for_fixture(league, int(fixture_id), **extra)
         return payload if raw else {
             "fixture_id": fixture_id,
+            "resolved": resolved_reason,
             "odds": normalize_odds(payload, preferred_bookmaker_id=bookmaker_id),
         }
     finally:
