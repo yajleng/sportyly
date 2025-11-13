@@ -1,18 +1,16 @@
 # app/routers/picks.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Query
 
 from ..clients.apisports import ApiSportsClient, League
 from ..core.config import get_settings
 from ..services.odds import normalize_odds
-from ..services.resolve import resolve_fixture_id
 
-# If you already have a picker, import it. If not, we’ll return odds and an empty list of picks.
+# optional picker (value/edge). If missing, we still return odds.
 _HAS_PICKER = True
 try:
-    # adapt this import name to whatever your picker exposes
     from ..services.picks import compute_picks_from_normalized as _compute_picks  # type: ignore
 except Exception:
     _HAS_PICKER = False
@@ -27,103 +25,114 @@ def _client() -> ApiSportsClient:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
     return ApiSportsClient(api_key=settings.apisports_key)
 
-
-@router.get("/picks", summary="Compute picks (auto-resolves fixture when needed)")
-def picks(
-    league: League = Query(..., description="nba | nfl | ncaaf | ncaab | soccer"),
-    # Path A: pass the game/fixture id directly (soccer fixture id OR AF game id)
-    fixture_id: Optional[int] = Query(
-        None, description="Soccer fixture id or American-football game id"
+# -------- /picks/auto : run across the daily slate --------
+@router.get(
+    "/picks/auto",
+    summary="Auto picks for a date (slate → odds → normalize → picks)",
+    description=(
+        "Batch pipeline for a given date. Uses /data/slate to discover games, "
+        "then fetches odds and computes picks. Start with NCAAF for best coverage."
     ),
-    # Path B (auto-resolve): provide date + at least one of home/away
-    date: Optional[str] = Query(
-        None, description="YYYY-MM-DD (use with home/away if fixture_id not given)"
-    ),
-    home: Optional[str] = Query(None, description="Home team name (partial OK)"),
-    away: Optional[str] = Query(None, description="Away team name (partial OK)"),
-    # Soccer-only helpers when resolving:
-    league_id_override: Optional[int] = Query(
-        None, description="Soccer competition (e.g., EPL=39)"
-    ),
-    season: Optional[int] = Query(None, description="Soccer season (e.g., 2025)"),
-    # Odds filters / picker hints
-    bookmaker_id: Optional[int] = Query(
-        None, description="Prefer odds from this bookmaker id"
-    ),
-    bet_id: Optional[int] = Query(None, description="Filter to specific bet/market id"),
-    raw_odds: bool = Query(
-        False, description="If true, returns provider odds without normalization"
-    ),
+)
+def picks_auto(
+    league: League = Query(..., description="ncaaf|nfl|nba|ncaab|soccer"),
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (defaults to today)"),
+    season: Optional[int] = Query(None, description="Season (soccer optional)"),
+    league_id_override: Optional[int] = Query(None, description="Soccer competition (e.g., EPL=39)"),
+    bookmaker_id: Optional[int] = Query(None, description="Prefer odds from this bookmaker id"),
+    ev_threshold: float = Query(0.02, ge=0.0, le=0.25, description="Min EV/edge to keep a pick (default 2%)"),
+    max_games: int = Query(50, ge=1, description="Safety cap for slate size"),
+    raw_odds: bool = Query(False, description="Return provider odds instead of normalized"),
 ):
     """
-    One call to:
-    1) resolve (if needed) -> 2) fetch odds -> 3) normalize -> 4) compute picks (if picker available).
+    1) Get slate for the date
+    2) For each game: get odds -> normalize -> compute picks (if picker present)
+    3) Return ranked picks per game
     """
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+
+    qdate = date  # let /data/slate default to today when None
+
     client = _client()
     try:
-        resolved_note = None
+        # ---- 1) slate ----
+        slate_payload = client.fixtures_by_date(
+            league=league, date=(qdate or ""), season=season, league_id=league_id_override
+        )
+        items = slate_payload.get("response") or slate_payload.get("results") or []
+        games: List[Dict[str, Any]] = []
 
-        # ---------- 1) Resolve if user didn't provide fixture_id ----------
-        if fixture_id is None:
-            if not date or not (home or away):
-                raise HTTPException(
-                    status_code=422,
-                    detail="Provide fixture_id OR (date and at least one of home/away) for auto-resolve.",
-                )
-            res = resolve_fixture_id(
-                client,
-                league=league,
-                date=date,
-                home=home,
-                away=away,
-                league_id_override=league_id_override,
-                season=season,
-            )
-            fixture_id = res.get("fixture_id")
-            resolved_note = res.get("picked_reason")
-            if not fixture_id:
-                # Surface candidates to your GPT/app for quick user confirmation
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "message": "Could not confidently resolve fixture; please confirm one of the candidates.",
-                        "candidates": res.get("candidates", []),
-                    },
-                )
-
-        # ---------- 2) Fetch odds ----------
-        extra = {}
-        if bookmaker_id is not None:
-            extra["bookmaker"] = bookmaker_id
-        if bet_id is not None:
-            extra["bet"] = bet_id
-
-        odds_payload = client.odds_for_fixture(league, int(fixture_id), **extra)
-
-        # ---------- 3) Normalize (unless raw requested) ----------
-        if raw_odds:
-            normalized = None
+        # normalize minimal fields
+        if league == "soccer":
+            for g in items[:max_games]:
+                try:
+                    games.append({
+                        "fixture_id": int(g["fixture"]["id"]),
+                        "date": g["fixture"]["date"],
+                        "home": g["teams"]["home"]["name"],
+                        "away": g["teams"]["away"]["name"],
+                    })
+                except Exception:
+                    continue
         else:
-            normalized = normalize_odds(
-                odds_payload, preferred_bookmaker_id=bookmaker_id
-            )
+            for g in items[:max_games]:
+                fid = g.get("id") or g.get("game", {}).get("id") or g.get("fixture", {}).get("id")
+                if not fid:
+                    continue
+                teams = g.get("teams") or {}
+                games.append({
+                    "fixture_id": int(fid),
+                    "date": g.get("date") or g.get("game", {}).get("date"),
+                    "home": (teams.get("home") or {}).get("name") or (g.get("home") or {}).get("name"),
+                    "away": (teams.get("away") or {}).get("name") or (g.get("away") or {}).get("name"),
+                })
 
-        # ---------- 4) Compute picks (if picker exists) ----------
-        if not _HAS_PICKER or normalized is None:
-            picks_out = []
-        else:
-            # Your picker should accept normalized odds and return a list of pick dicts.
-            # If your function name/signature differs, update the import/line above.
-            picks_out = _compute_picks(
-                league=league, normalized_odds=normalized, bookmaker_id=bookmaker_id
-            )
+        out: List[Dict[str, Any]] = []
 
+        # ---- 2) per-game odds -> normalize -> picks ----
+        for game in games:
+            fid = game["fixture_id"]
+            try:
+                extra = {}
+                if bookmaker_id is not None:
+                    extra["bookmaker"] = bookmaker_id
+
+                odds_payload = client.odds_for_fixture(league, int(fid), **extra)
+
+                if raw_odds:
+                    normalized = None
+                else:
+                    normalized = normalize_odds(odds_payload, preferred_bookmaker_id=bookmaker_id)
+
+                if _HAS_PICKER and normalized is not None:
+                    picks = _compute_picks(
+                        league=league, normalized_odds=normalized, bookmaker_id=bookmaker_id, min_edge=ev_threshold
+                    )
+                else:
+                    picks = []
+
+                out.append({
+                    "fixture_id": fid,
+                    "matchup": {"home": game["home"], "away": game["away"], "date": game["date"]},
+                    "odds": odds_payload if raw_odds else normalized,
+                    "picks": picks,
+                })
+            except Exception as e:
+                out.append({
+                    "fixture_id": fid,
+                    "matchup": {"home": game.get("home"), "away": game.get("away"), "date": game.get("date")},
+                    "error": str(e),
+                })
+
+        # Optional: sort each game's picks by edge (already done in picker), or
+        # filter games with at least one pick above threshold:
         return {
-            "fixture_id": fixture_id,
-            "resolved": resolved_note,
             "league": league,
-            "odds": odds_payload if raw_odds else normalized,
-            "picks": picks_out,
+            "date": qdate,
+            "count_games": len(out),
+            "items": out,
         }
 
     finally:
