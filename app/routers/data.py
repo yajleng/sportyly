@@ -14,19 +14,53 @@ def _client() -> ApiSportsClient:
     settings = get_settings()
     return ApiSportsClient(api_key=settings.apisports_key)
 
-# ---------------- Injuries ----------------
+# ---------------- Injuries (unified across sports) ----------------
 @router.get("/injuries")
 def injuries(
     league: League = Query(..., description="nba | nfl | ncaaf | ncaab | soccer"),
-    date: Optional[str] = Query(None, description="YYYY-MM-DD (optional)"),
-    league_id_override: Optional[int] = Query(None, description="Override default league id (mainly for soccer)"),
+    # optional, varies by sport:
+    season: Optional[int] = Query(None, description="Required for soccer; ignored by NFL/NCAAF"),
+    league_id_override: Optional[int] = Query(None, description="Soccer competition ID (e.g., EPL=39)"),
+    team: Optional[int] = Query(None, description="Team ID (required for NFL/NCAAF if player not given)"),
+    player: Optional[int] = Query(None, description="Player ID (required for NFL/NCAAF if team not given)"),
 ):
     """
-    Fetch injury reports from API-SPORTS. Returns raw provider JSON.
+    Unified injuries gateway:
+
+    - NFL/NCAAF (american-football): requires at least one of team or player.
+    - Soccer (football v3): requires league_id_override and season; team/player optional.
+    - NBA/NCAAB: not available in API-SPORTS -> 501 Not Implemented.
     """
+    # Validate per-league requirements
+    if league in ("nba", "ncaab"):
+        raise HTTPException(status_code=501, detail="Injuries not available for basketball in API-SPORTS")
+
+    if league in ("nfl", "ncaaf"):
+        if not team and not player:
+            raise HTTPException(status_code=422, detail="Provide team or player for NFL/NCAAF injuries")
+
+    if league == "soccer":
+        if not league_id_override or not season:
+            raise HTTPException(status_code=422, detail="Provide league_id_override and season for soccer injuries")
+
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+
     client = _client()
     try:
-        return client.injuries(league, date=date, league_id=league_id_override)
+        kwargs: dict = {}
+        if team is not None:
+            kwargs["team"] = team
+        if player is not None:
+            kwargs["player"] = player
+
+        if league == "soccer":
+            # soccer needs league + season (client maps league_id -> "league" query)
+            return client.injuries(league, league_id=league_id_override, season=season, **kwargs)
+
+        # american-football: just pass team/player (no season needed)
+        return client.injuries(league, **kwargs)
     finally:
         client.close()
 
@@ -49,7 +83,7 @@ def history(
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
 
-    client = ApiSportsClient(api_key=settings.apisports_key)
+    client = _client()
     try:
         fx = client.fixtures_range(
             league,
@@ -79,7 +113,6 @@ def history(
                 home = (teams.get("home") or {}).get("name") or (g.get("home") or {}).get("name")
                 away = (teams.get("away") or {}).get("name") or (g.get("away") or {}).get("name")
                 sc = g.get("scores") or g.get("score") or {}
-                # handle dict-or-int shapes
                 hsc = sc.get("home")
                 asc = sc.get("away")
                 hs = (hsc.get("total") if isinstance(hsc, dict) else hsc)
@@ -109,6 +142,7 @@ def history(
     finally:
         client.close()
 
+# ---------------- Odds (raw or normalized) ----------------
 @router.get("/odds")
 def odds(
     league: League,
@@ -118,7 +152,7 @@ def odds(
     settings = get_settings()
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
-    client = ApiSportsClient(api_key=settings.apisports_key)
+    client = _client()
     try:
         payload = client.odds_for_fixture(league, fixture_id)
         return payload if raw else {"fixture_id": fixture_id, "odds": normalize_odds(payload)}
