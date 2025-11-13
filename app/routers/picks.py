@@ -91,4 +91,40 @@ def picks(
                     },
                 )
 
-        # ----------
+        # ---------- 2) Fetch odds ----------
+        extra = {}
+        if bookmaker_id is not None:
+            extra["bookmaker"] = bookmaker_id
+        if bet_id is not None:
+            extra["bet"] = bet_id
+
+        odds_payload = client.odds_for_fixture(league, int(fixture_id), **extra)
+
+        # ---------- 3) Normalize (unless raw requested) ----------
+        if raw_odds:
+            normalized = None
+        else:
+            normalized = normalize_odds(
+                odds_payload, preferred_bookmaker_id=bookmaker_id
+            )
+
+        # ---------- 4) Compute picks (if picker exists) ----------
+        if not _HAS_PICKER or normalized is None:
+            picks_out = []
+        else:
+            # Your picker should accept normalized odds and return a list of pick dicts.
+            # If your function name/signature differs, update the import/line above.
+            picks_out = _compute_picks(
+                league=league, normalized_odds=normalized, bookmaker_id=bookmaker_id
+            )
+
+        return {
+            "fixture_id": fixture_id,
+            "resolved": resolved_note,
+            "league": league,
+            "odds": odds_payload if raw_odds else normalized,
+            "picks": picks_out,
+        }
+
+    finally:
+        client.close()
