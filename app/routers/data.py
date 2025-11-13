@@ -15,33 +15,54 @@ def _client() -> ApiSportsClient:
     return ApiSportsClient(api_key=settings.apisports_key)
 
 # ---------------- Injuries (unified across sports) ----------------
-@router.get("/injuries")
+@router.get(
+    "/injuries",
+    summary="Unified injuries",
+    description=(
+        "Get current injuries from API-SPORTS.\n\n"
+        "**Rules by league:**\n"
+        "- **nfl / ncaaf** (american-football): **team OR player is required** (at least one).\n"
+        "- **soccer** (API-Football v3): **league_id_override** (competition) **AND** **season** are required; team/player optional.\n"
+        "- **nba / ncaab**: injuries not provided by API-SPORTS → 501.\n\n"
+        "**Examples:**\n"
+        "- NFL by team: `/data/injuries?league=nfl&team=15`\n"
+        "- NFL by player: `/data/injuries?league=nfl&player=53`\n"
+        "- Soccer (EPL): `/data/injuries?league=soccer&league_id_override=39&season=2025`\n"
+        "- NBA (not supported): `/data/injuries?league=nba`\n"
+    ),
+)
 def injuries(
     league: League = Query(..., description="nba | nfl | ncaaf | ncaab | soccer"),
-    # optional, varies by sport:
-    season: Optional[int] = Query(None, description="Required for soccer; ignored by NFL/NCAAF"),
-    league_id_override: Optional[int] = Query(None, description="Soccer competition ID (e.g., EPL=39)"),
-    team: Optional[int] = Query(None, description="Team ID (required for NFL/NCAAF if player not given)"),
-    player: Optional[int] = Query(None, description="Player ID (required for NFL/NCAAF if team not given)"),
+    season: Optional[int] = Query(None, description="Required for soccer; ignored by NFL/NCAAF", example=2025),
+    league_id_override: Optional[int] = Query(
+        None, description="Soccer competition ID (e.g., EPL=39, LaLiga=140, MLS=253)", example=39
+    ),
+    team: Optional[int] = Query(None, description="Team ID (required for NFL/NCAAF if player not given)", example=15),
+    player: Optional[int] = Query(None, description="Player ID (required for NFL/NCAAF if team not given)", example=53),
 ):
     """
-    Unified injuries gateway:
-
-    - NFL/NCAAF (american-football): requires at least one of team or player.
-    - Soccer (football v3): requires league_id_override and season; team/player optional.
-    - NBA/NCAAB: not available in API-SPORTS -> 501 Not Implemented.
+    Unified injuries gateway (see description for per-league rules).
     """
     # Validate per-league requirements
     if league in ("nba", "ncaab"):
-        raise HTTPException(status_code=501, detail="Injuries not available for basketball in API-SPORTS")
+        raise HTTPException(
+            status_code=501,
+            detail="Injuries are not provided for NBA/NCAAB by API-SPORTS."
+        )
 
     if league in ("nfl", "ncaaf"):
         if not team and not player:
-            raise HTTPException(status_code=422, detail="Provide team or player for NFL/NCAAF injuries")
+            raise HTTPException(
+                status_code=422,
+                detail="NFL/NCAAF injuries require at least one of: team or player."
+            )
 
     if league == "soccer":
         if not league_id_override or not season:
-            raise HTTPException(status_code=422, detail="Provide league_id_override and season for soccer injuries")
+            raise HTTPException(
+                status_code=422,
+                detail="Soccer injuries require league_id_override (competition) and season."
+            )
 
     settings = get_settings()
     if not settings.apisports_key:
@@ -56,7 +77,7 @@ def injuries(
             kwargs["player"] = player
 
         if league == "soccer":
-            # soccer needs league + season (client maps league_id -> "league" query)
+            # soccer needs league + season (client maps league_id -> 'league' on wire)
             return client.injuries(league, league_id=league_id_override, season=season, **kwargs)
 
         # american-football: just pass team/player (no season needed)
@@ -143,7 +164,18 @@ def history(
         client.close()
 
 # ---------------- Odds (raw or normalized) ----------------
-@router.get("/odds")
+@router.get(
+    "/odds",
+    summary="Fixture odds (raw or normalized)",
+    description=(
+        "Fetch bookmaker odds for a fixture/game.\n\n"
+        "- For soccer, pass the **fixture id**.\n"
+        "- For american-football, pass the **game id** (our client maps this from fixture_id).\n\n"
+        "**Examples:**\n"
+        "- Normalized: `/data/odds?league=soccer&fixture_id=1378969`\n"
+        "- Raw: `/data/odds?league=soccer&fixture_id=1378969&raw=true`\n"
+    ),
+)
 def odds(
     league: League,
     fixture_id: int,
