@@ -1,162 +1,218 @@
 # app/services/odds.py
 from __future__ import annotations
+
 from typing import Any, Dict, Optional
 
-"""
-Normalize API-SPORTS odds payloads into a compact, consistent structure
-we can use for moneyline, spread, totals, half totals, and quarter totals.
 
-API-SPORTS varies a bit by sport/bookmaker:
-- basketball & american-football (v1) often: bookmakers -> bets -> values
-- football/soccer (v3) often: bookmakers -> markets -> outcomes
-We try both shapes and fall back gracefully if a market isn't present.
-"""
+def _pick_bookmaker(bookmakers: list[dict], preferred_id: Optional[int]) -> Optional[dict]:
+    if not bookmakers:
+        return None
+    if preferred_id:
+        for bm in bookmakers:
+            if bm.get("id") == preferred_id:
+                return bm
+    # fallback: first bookmaker with bets
+    for bm in bookmakers:
+        if bm.get("bets"):
+            return bm
+    return bookmakers[0]
 
-MarketOut = Dict[str, Optional[float]]  # {"home_price":..., "away_price":..., "line":...} or O/U
-NormalizedOdds = Dict[str, Optional[Dict[str, Any]]]
+
+def _soccer_map(bm: dict) -> dict:
+    """
+    API-Football v3 structure:
+      response: [
+        {
+          "bookmakers": [
+            {
+              "id": ...,
+              "name": "...",
+              "bets": [
+                {"id": ..., "name": "Match Winner", "values": [{"value":"Home","odd":"1.90"}, ...]},
+                {"name":"Over/Under", "values":[{"value":"Over 2.5","odd":"1.95","handicap":"2.5"}, {"value":"Under 2.5","odd":"1.85","handicap":"2.5"}]},
+                {"name":"Asian Handicap", "values":[{"value":"Home -1.0","odd":"1.96","handicap":"-1.0"}, {"value":"Away +1.0","odd":"1.86","handicap":"+1.0"}]},
+                ...
+              ]
+            }
+          ]
+        }
+      ]
+    """
+    out = {
+        "moneyline": None,
+        "spread": None,
+        "total": None,
+        "half_total": None,
+        "quarter_total": None,
+    }
+
+    bets = bm.get("bets") or []
+
+    # Moneyline (3-way)
+    for b in bets:
+        name = (b.get("name") or "").lower()
+        if name in {"match winner", "1x2", "3way result", "full time result"}:
+            ml = {"home": None, "away": None, "draw": None}
+            for v in b.get("values") or []:
+                val = (v.get("value") or "").lower()
+                price = _to_float(v.get("odd"))
+                if "home" in val or val == "1":
+                    ml["home"] = price
+                elif "away" in val or val == "2":
+                    ml["away"] = price
+                elif "draw" in val or val in {"x", "draw"}:
+                    ml["draw"] = price
+            out["moneyline"] = ml
+            break
+
+    # Over/Under totals (full game)
+    for b in bets:
+        name = (b.get("name") or "").lower()
+        if name in {"over/under", "goals over/under", "total"}:
+            # Pick common handicap (first)
+            best_line = None
+            over = under = None
+            for v in b.get("values") or []:
+                line = v.get("handicap")
+                price = _to_float(v.get("odd"))
+                label = (v.get("value") or "").lower()
+                # parse lines like 'Over 2.5'
+                if best_line is None and line is not None:
+                    best_line = _to_float(line)
+                if "over" in label:
+                    over = price
+                elif "under" in label:
+                    under = price
+            if best_line is not None:
+                out["total"] = {"line": best_line, "over": over, "under": under}
+            break
+
+    # Asian Handicap (treat as primary spread)
+    for b in bets:
+        name = (b.get("name") or "").lower()
+        if name in {"asian handicap", "handicap", "spread"}:
+            home = away = None
+            home_line = away_line = None
+            for v in b.get("values") or []:
+                label = (v.get("value") or "").lower()
+                price = _to_float(v.get("odd"))
+                line = _to_float(v.get("handicap"))
+                if label.startswith("home") or "home" in label or label.startswith("1"):
+                    home = price
+                    home_line = line
+                elif label.startswith("away") or "away" in label or label.startswith("2"):
+                    away = price
+                    away_line = line
+            # prefer a single symmetric line if possible
+            line = home_line if home_line is not None else away_line
+            out["spread"] = {
+                "line": line,
+                "home_price": home,
+                "away_price": away,
+            }
+            break
+
+    return out
+
+
+def _af_map(bm: dict) -> dict:
+    """
+    American Football (NFL/NCAAF) structure under v1.american-football:
+      response: [
+        {
+          "bookmakers":[
+            {"name":"...", "bets":[
+                {"name":"Moneyline","values":[{"value":"Home","odd":"-110"}, {"value":"Away","odd":"+100"}]},
+                {"name":"Spreads","values":[{"value":"Home","odd":"-110","handicap":"-3.5"}, {"value":"Away","odd":"-110","handicap":"+3.5"}]},
+                {"name":"Totals","values":[{"value":"Over","odd":"-105","handicap":"47.5"},{"value":"Under","odd":"-115","handicap":"47.5"}]}
+            ] }
+          ]
+        }
+      ]
+    """
+    out = {
+        "moneyline": None,
+        "spread": None,
+        "total": None,
+        "half_total": None,
+        "quarter_total": None,
+    }
+
+    bets = bm.get("bets") or []
+
+    # Moneyline
+    for b in bets:
+        if (b.get("name") or "").lower() in {"moneyline", "ml"}:
+            ml = {"home": None, "away": None}
+            for v in b.get("values") or []:
+                label = (v.get("value") or "").lower()
+                price = _to_float(v.get("odd"))
+                if "home" in label:
+                    ml["home"] = price
+                elif "away" in label:
+                    ml["away"] = price
+            out["moneyline"] = ml
+            break
+
+    # Spreads
+    for b in bets:
+        if (b.get("name") or "").lower() in {"spread", "spreads", "handicap"}:
+            home = away = None
+            line = None
+            for v in b.get("values") or []:
+                label = (v.get("value") or "").lower()
+                price = _to_float(v.get("odd"))
+                line = line or _to_float(v.get("handicap"))
+                if "home" in label:
+                    home = price
+                elif "away" in label:
+                    away = price
+            if line is not None:
+                out["spread"] = {"line": line, "home_price": home, "away_price": away}
+            break
+
+    # Totals
+    for b in bets:
+        if (b.get("name") or "").lower() in {"total", "totals", "over/under"}:
+            over = under = None
+            line = None
+            for v in b.get("values") or []:
+                label = (v.get("value") or "").lower()
+                price = _to_float(v.get("odd"))
+                line = line or _to_float(v.get("handicap"))
+                if "over" in label:
+                    over = price
+                elif "under" in label:
+                    under = price
+            if line is not None:
+                out["total"] = {"line": line, "over": over, "under": under}
+            break
+
+    return out
+
 
 def _to_float(x: Any) -> Optional[float]:
     if x is None:
         return None
-    s = str(x).strip()
-    # accept plain ints/floats or strings like "+110", "-105", "2.5"
     try:
-        if s.startswith("+") and s[1:].isdigit():
-            return float(s[1:])
-        if s.startswith("-") and s[1:].isdigit():
-            return float(s)
-        return float(s)
+        return float(str(x).replace("+", ""))  # keep American style numeric if present
     except Exception:
         return None
 
-def _first_book(payload: Dict[str, Any]) -> Dict[str, Any]:
-    resp = payload.get("response") or []
-    if not resp:
-        return {}
-    row = resp[0]
-    # try typical keys
-    books = row.get("bookmakers") or row.get("odds") or []
-    return books[0] if books else {}
 
-def _iter_markets(book: Dict[str, Any]):
-    # v1 style
-    for m in book.get("bets", []) or []:
-        yield m
-    # v3 style
-    for m in book.get("markets", []) or []:
-        yield m
-
-def _name_lower(m: Dict[str, Any]) -> str:
-    return (m.get("name") or m.get("key") or "").lower()
-
-def _find_market(book: Dict[str, Any], candidates: list[str]) -> Optional[Dict[str, Any]]:
-    cl = [c.lower() for c in candidates]
-    for m in _iter_markets(book):
-        n = _name_lower(m)
-        if any(c in n for c in cl):
-            return m
-    return None
-
-def _iter_outcomes(m: Dict[str, Any]):
-    # v1 often: values; v3 often: outcomes
-    vals = m.get("values")
-    if isinstance(vals, list) and vals:
-        for o in vals:
-            yield o
-    outs = m.get("outcomes")
-    if isinstance(outs, list) and outs:
-        for o in outs:
-            yield o
-
-def _extract_handicap(o: Dict[str, Any]) -> Optional[float]:
-    for k in ("handicap", "point", "total", "line", "value"):
-        v = o.get(k)
-        fv = _to_float(v)
-        if fv is not None:
-            return fv
-    return None
-
-def _extract_price(o: Dict[str, Any]) -> Optional[float]:
-    for k in ("odd", "price", "american"):
-        v = o.get(k)
-        fv = _to_float(v)
-        if fv is not None:
-            return fv
-    # some books use "decimal"; we keep as float but caller can convert if needed
-    for k in ("decimal",):
-        v = o.get(k)
-        try:
-            return float(v)
-        except Exception:
-            pass
-    return None
-
-def _normalize_ml(m: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
-    if not m:
-        return None
-    out: Dict[str, Optional[float]] = {"home_price": None, "away_price": None}
-    for o in _iter_outcomes(m):
-        name = (o.get("name") or o.get("label") or "").lower()
-        p = _extract_price(o)
-        if "home" in name or name in ("1", "team 1"):
-            out["home_price"] = p
-        elif "away" in name or name in ("2", "team 2"):
-            out["away_price"] = p
-        elif "draw" in name or name == "x":
-            # ML for draw in soccer (three-way). Store as separate key.
-            out["draw_price"] = p  # type: ignore
-    if all(v is None for v in out.values()):
-        return None
-    return out
-
-def _normalize_spread(m: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
-    if not m:
-        return None
-    out: Dict[str, Optional[float]] = {"home_line": None, "home_price": None, "away_line": None, "away_price": None}
-    for o in _iter_outcomes(m):
-        name = (o.get("name") or o.get("label") or "").lower()
-        p = _extract_price(o)
-        h = _extract_handicap(o)
-        if "home" in name or name in ("1", "team 1"):
-            out["home_line"], out["home_price"] = h, p
-        elif "away" in name or name in ("2", "team 2"):
-            out["away_line"], out["away_price"] = h, p
-    if all(v is None for v in out.values()):
-        return None
-    return out
-
-def _normalize_total(m: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
-    if not m:
-        return None
-    out: Dict[str, Optional[float]] = {"total": None, "over_price": None, "under_price": None}
-    for o in _iter_outcomes(m):
-        name = (o.get("name") or o.get("label") or "").lower()
-        p = _extract_price(o)
-        h = _extract_handicap(o)
-        if "over" in name:
-            out["total"] = out["total"] if out["total"] is not None else h
-            out["over_price"] = p
-        elif "under" in name:
-            out["total"] = out["total"] if out["total"] is not None else h
-            out["under_price"] = p
-    if all(v is None for v in out.values()):
-        return None
-    return out
-
-def normalize_odds(odds_payload: Dict[str, Any]) -> NormalizedOdds:
+def normalize_odds(payload: Dict[str, Any], preferred_bookmaker_id: Optional[int] = None) -> Dict[str, Any]:
     """
-    Returns:
-    {
-      "moneyline": {"home_price": -120, "away_price": +105, "draw_price": +260?},
-      "spread": {"home_line": -3.5, "home_price": -110, "away_line": +3.5, "away_price": -110},
-      "total": {"total": 224.5, "over_price": -110, "under_price": -110},
-      "half_total": {...} | None,
-      "quarter_total": {...} | None
-    }
-    Missing markets => None.
+    Returns a unified odds dict:
+      {
+        "moneyline": {"home": float, "away": float, "draw": float|None},
+        "spread": {"line": float, "home_price": float, "away_price": float}|None,
+        "total": {"line": float, "over": float, "under": float}|None,
+        "half_total": None,
+        "quarter_total": None
+      }
     """
-    book = _first_book(odds_payload)
-    if not book:
+    resp = payload.get("response")
+    if not isinstance(resp, list) or not resp:
         return {
             "moneyline": None,
             "spread": None,
@@ -165,23 +221,22 @@ def normalize_odds(odds_payload: Dict[str, Any]) -> NormalizedOdds:
             "quarter_total": None,
         }
 
-    # Map likely market names for each target
-    ml = _find_market(book, ["moneyline", "match winner", "winner"])
-    sp = _find_market(book, ["spread", "handicap"])
-    tot = _find_market(book, ["total", "over/under", "over under"])
+    node = resp[0]  # we’ll use the first fixture payload
+    bookmakers = node.get("bookmakers") or []
+    bm = _pick_bookmaker(bookmakers, preferred_bookmaker_id)
+    if not bm:
+        return {
+            "moneyline": None,
+            "spread": None,
+            "total": None,
+            "half_total": None,
+            "quarter_total": None,
+        }
 
-    # Period markets (will exist only when book provides them)
-    htot = _find_market(book, [
-        "1st half total", "first half total", "half - total", "half total", "1h total"
-    ])
-    qtot = _find_market(book, [
-        "1st quarter total", "first quarter total", "quarter total", "1q total"
-    ])
-
-    return {
-        "moneyline": _normalize_ml(ml),
-        "spread": _normalize_spread(sp),
-        "total": _normalize_total(tot),
-        "half_total": _normalize_total(htot),
-        "quarter_total": _normalize_total(qtot),
-    }
+    # Detect sport by presence of soccer keys (safe inference)
+    # Soccer payloads include team/league/fixture objects elsewhere, but we rely on market names:
+    names = { (bet.get("name") or "").lower() for bet in (bm.get("bets") or []) }
+    if {"match winner", "over/under"} & names or "asian handicap" in names:
+        return _soccer_map(bm)
+    else:
+        return _af_map(bm)
