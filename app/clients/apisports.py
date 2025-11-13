@@ -138,9 +138,9 @@ class ApiSportsClient:
     def injuries(
         self,
         league: League,
-        date: Optional[str] = None,            # "YYYY-MM-DD"
+        date: Optional[str] = None,            # "YYYY-MM-DD" (ignored for AF)
         league_id: Optional[int] = None,
-        **kw: Any,
+        **kw: Any,                              # allows season/team/player passthrough
     ) -> Dict[str, Any]:
         base = get_base_for_league(league)
         params: Dict[str, Any] = {}
