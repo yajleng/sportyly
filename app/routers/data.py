@@ -151,28 +151,45 @@ def history(
 # ---------------- Odds (raw or normalized) ----------------
 @router.get(
     "/odds",
-    summary="Fixture odds (raw or normalized)",
+    summary="Fixture/game odds (raw or normalized)",
     description=(
-        "Fetch bookmaker odds for a fixture/game.\n\n"
-        "- For soccer, pass the **fixture id**.\n"
-        "- For american-football, pass the **game id** (our client maps this from fixture_id).\n\n"
+        "Fetch bookmaker odds for a fixture (soccer) or game (american-football).\n\n"
+        "- **soccer** (API-Football v3): pass the *fixture id* (`fixture_id=`).\n"
+        "- **nfl/ncaaf** (american-football v1): pass the *game id* (`fixture_id=` maps to `game` on the provider).\n"
+        "Optional filters:\n"
+        "- `bookmaker_id` → provider `bookmaker`\n"
+        "- `bet_id` → provider `bet`\n\n"
         "**Examples:**\n"
-        "- Normalized: `/data/odds?league=soccer&fixture_id=1378969`\n"
-        "- Raw: `/data/odds?league=soccer&fixture_id=1378969&raw=true`\n"
+        "- Soccer normalized: `/data/odds?league=soccer&fixture_id=1378969`\n"
+        "- Soccer raw: `/data/odds?league=soccer&fixture_id=1378969&raw=true`\n"
+        "- NFL by game + bookmaker: `/data/odds?league=nfl&fixture_id=7532&bookmaker_id=6`\n"
     ),
 )
 def odds(
     league: League,
     fixture_id: int,
     raw: bool = False,
-    bookmaker_id: Optional[int] = Query(None, description="Prefer odds from this bookmaker id"),
+    bookmaker_id: Optional[int] = Query(
+        None, description="Prefer odds from this bookmaker id (provider param: bookmaker)"
+    ),
+    bet_id: Optional[int] = Query(
+        None, description="Filter to a specific bet/market id (provider param: bet)"
+    ),
 ):
     settings = get_settings()
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+
     client = _client()
     try:
-        payload = client.odds_for_fixture(league, fixture_id)
+        # Pass optional filters straight through — our client forwards unknown kwargs.
+        extra: dict = {}
+        if bookmaker_id is not None:
+            extra["bookmaker"] = bookmaker_id
+        if bet_id is not None:
+            extra["bet"] = bet_id
+
+        payload = client.odds_for_fixture(league, fixture_id, **extra)
         return payload if raw else {
             "fixture_id": fixture_id,
             "odds": normalize_odds(payload, preferred_bookmaker_id=bookmaker_id),
