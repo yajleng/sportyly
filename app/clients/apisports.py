@@ -6,7 +6,7 @@ import httpx
 
 from ..core.config import get_base_for_league, get_league_id
 
-# Public type used across the app
+# Keep the type local here to avoid any import cycles
 League = Literal["nba", "nfl", "ncaaf", "ncaab", "soccer"]
 
 
@@ -170,8 +170,6 @@ class ApiSportsClient:
 
     # ------------ bookmakers ------------
     def bookmakers(self, league: League) -> Dict[str, Any]:
-        """
-        GET /odds/bookmakers (no params) for the league's family.
-        """
+        """GET /odds/bookmakers (no params) for the league's family."""
         base = self._base(league)
         return self._get(f"{base}/odds/bookmakers")
