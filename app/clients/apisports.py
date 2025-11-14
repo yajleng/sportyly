@@ -11,6 +11,26 @@ from app.core.config import (
 )
 
 class ApiSportsClient:
+    # ...existing code...
+
+    def bookmakers(self, league: League) -> dict:
+        """
+        Return provider bookmaker catalog for the given league/sport.
+        API-Sports exposes a bookmakers list under the sport's odds namespace.
+        """
+        # pick the sport root the same way you already route fixtures/odds
+        if league == "soccer":
+            path = "/odds/bookmakers"      # API-Football v3
+            base = self._football_base     # whatever you use for soccer
+        else:
+            path = "/odds/bookmakers"      # American Football odds catalog
+            base = self._gridiron_base     # your AF base (nfl/ncaaf)
+
+        url = f"{base}{path}"
+        return self._get(url, params={})   # mirrors your other GET helpers
+
+
+class ApiSportsClient:
     def __init__(self, api_key: str, timeout: float = 20.0):
         self._client = httpx.Client(
             timeout=timeout,
