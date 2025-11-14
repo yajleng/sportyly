@@ -23,7 +23,6 @@ class ResolveQuery(_Strict):
 
 class OddsQuery(_Strict):
     league: League
-    # either fixture_id OR (date + home/away)
     fixture_id: Optional[int] = None
     raw: bool = False
     bookmaker_id: Optional[int] = Field(default=None, description="provider 'bookmaker'")
