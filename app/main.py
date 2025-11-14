@@ -1,6 +1,8 @@
 # app/main.py
 from fastapi import FastAPI
 from .routers import health, picks, backtest, data
+from .routers import debug  # add import
+
 
 app = FastAPI(title="GPT Picks API", version="0.1.0")
 
@@ -9,7 +11,7 @@ app.include_router(health.router)
 app.include_router(picks.router)
 app.include_router(backtest.router)
 app.include_router(data.router)
-
+app.include_router(debug.router)  # add line
 @app.get("/")
 def root():
     return {"service": "gpt-picks-api"}
