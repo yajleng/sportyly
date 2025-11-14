@@ -1,5 +1,6 @@
 # app/routers/data.py
 from __future__ import annotations
+from ..services.validation import validate_params
 
 from typing import List, Optional
 from fastapi import APIRouter, Query, HTTPException
