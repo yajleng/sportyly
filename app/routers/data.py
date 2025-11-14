@@ -46,6 +46,29 @@ def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
             "venue_city": venue_city,
         }
 
+@router.get(
+    "/bookmakers",
+    summary="List bookmaker IDs for a league",
+    description="Returns the API-SPORTS bookmaker catalog (id, name) for the selected league.",
+)
+def bookmakers(league: League):
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+
+    c = _client()
+    try:
+        payload = c.bookmakers(league)
+        rows = payload.get("response") or payload.get("bookmakers") or []
+        # Normalize: [{id, name}]
+        out = [{"id": int(b.get("id")), "name": b.get("name")} for b in rows if b.get("id")]
+        # Stable, case-insensitive sort by name
+        out.sort(key=lambda x: (x["name"] or "").lower())
+        return {"count": len(out), "league": league, "items": out}
+    finally:
+        c.close()
+
+
 # ---------------- Slate (daily fixtures) ----------------
 @router.get(
     "/slate",
