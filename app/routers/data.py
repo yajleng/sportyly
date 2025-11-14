@@ -1,23 +1,29 @@
+# app/routers/data.py
 from __future__ import annotations
 
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Query, HTTPException, Depends
 from datetime import date as _date
+
+from fastapi import APIRouter, Query, HTTPException, Depends
 
 from ..clients.apisports import ApiSportsClient, League
 from ..core.config import get_settings
 from ..services.odds import normalize_odds
 from ..services.resolve import resolve_fixture_id
+from ..services.validation import validate_league  # used by /bookmakers
 from ..schemas.query import SlateQuery, ResolveQuery, OddsQuery
 
 router = APIRouter(prefix="/data", tags=["data"])
+
 
 def _client() -> ApiSportsClient:
     settings = get_settings()
     return ApiSportsClient(api_key=settings.apisports_key)
 
+
 # ---------- helpers ----------
 def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize minimal game fields across families."""
     if league == "soccer":
         fid = g["fixture"]["id"]
         dt = g["fixture"]["date"]
@@ -46,12 +52,16 @@ def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
             "venue_city": venue_city,
         }
 
+
+# ---------------- Bookmakers ----------------
 @router.get(
     "/bookmakers",
     summary="List bookmaker IDs for a league",
     description="Returns the API-SPORTS bookmaker catalog (id, name) for the selected league.",
 )
-def bookmakers(league: League):
+def bookmakers(league: League = Query(..., description="nba | nfl | ncaaf | ncaab | soccer")):
+    validate_league(league)
+
     settings = get_settings()
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
@@ -60,9 +70,7 @@ def bookmakers(league: League):
     try:
         payload = c.bookmakers(league)
         rows = payload.get("response") or payload.get("bookmakers") or []
-        # Normalize: [{id, name}]
         out = [{"id": int(b.get("id")), "name": b.get("name")} for b in rows if b.get("id")]
-        # Stable, case-insensitive sort by name
         out.sort(key=lambda x: (x["name"] or "").lower())
         return {"count": len(out), "league": league, "items": out}
     finally:
@@ -73,7 +81,7 @@ def bookmakers(league: League):
 @router.get(
     "/slate",
     summary="Get daily slate (fixtures) for a league",
-    description="Returns the day's fixtures with normalized fields."
+    description="Returns the day's fixtures with normalized fields.",
 )
 def slate(q: SlateQuery = Depends()):
     settings = get_settings()
@@ -95,6 +103,7 @@ def slate(q: SlateQuery = Depends()):
         return {"count": len(rows), "league": q.league, "date": qdate, "items": rows}
     finally:
         client.close()
+
 
 # ---------------- Injuries (unified across sports) ----------------
 @router.get(
@@ -140,6 +149,7 @@ def injuries(
     finally:
         client.close()
 
+
 # ---------------- Resolve id by teams/date ----------------
 @router.get("/resolve", summary="Resolve a fixture/game id by teams and date")
 def resolve_endpoint(q: ResolveQuery = Depends()):
@@ -156,6 +166,7 @@ def resolve_endpoint(q: ResolveQuery = Depends()):
         )
     finally:
         client.close()
+
 
 # ---------------- History (with optional odds) ----------------
 @router.get("/history")
@@ -222,11 +233,12 @@ def history(
     finally:
         client.close()
 
+
 # ---------------- Odds (auto-resolve supported, strict params) ----------------
 @router.get(
     "/odds",
     summary="Fixture/game odds (raw or normalized)",
-    description="Pass a fixture_id or give date+home/away to auto-resolve."
+    description="Pass a fixture_id or give date+home/away to auto-resolve.",
 )
 def odds(q: OddsQuery = Depends()):
     settings = get_settings()
@@ -240,7 +252,10 @@ def odds(q: OddsQuery = Depends()):
 
         if fixture_id is None:
             if not q.date or not (q.home or q.away):
-                raise HTTPException(status_code=422, detail="Provide fixture_id OR (date and at least one of home/away).")
+                raise HTTPException(
+                    status_code=422,
+                    detail="Provide fixture_id OR (date and at least one of home/away).",
+                )
             res = resolve_fixture_id(
                 client,
                 league=q.league,
@@ -253,14 +268,19 @@ def odds(q: OddsQuery = Depends()):
             fixture_id = res.get("fixture_id")
             resolved_reason = res.get("picked_reason")
             if not fixture_id:
-                raise HTTPException(status_code=409, detail={
-                    "message": "Could not confidently resolve fixture; please confirm one of the candidates.",
-                    "candidates": res.get("candidates", []),
-                })
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Could not confidently resolve fixture; please confirm one of the candidates.",
+                        "candidates": res.get("candidates", []),
+                    },
+                )
 
         extra: dict = {}
-        if q.bookmaker_id is not None: extra["bookmaker"] = q.bookmaker_id
-        if q.bet_id is not None: extra["bet"] = q.bet_id
+        if q.bookmaker_id is not None:
+            extra["bookmaker"] = q.bookmaker_id
+        if q.bet_id is not None:
+            extra["bet"] = q.bet_id
 
         payload = client.odds_for_fixture(q.league, int(fixture_id), **extra)
         return payload if q.raw else {
