@@ -1,34 +1,14 @@
 # app/clients/apisports.py
 from __future__ import annotations
 
-import httpx
 from typing import Any, Dict, Optional
+import httpx
 
 from app.core.config import (
-    League,                 # Literal["nba","nfl","ncaaf","ncaab","soccer"]
-    get_base_for_league,    # returns base URL per league family
-    get_league_id,          # returns default league id (or override)
+    League,              # Literal["nba","nfl","ncaaf","ncaab","soccer"]
+    get_base_for_league, # base URL per league family
+    get_league_id,       # default league id (or override)
 )
-
-class ApiSportsClient:
-    # ...existing code...
-
-    def bookmakers(self, league: League) -> dict:
-        """
-        Return provider bookmaker catalog for the given league/sport.
-        API-Sports exposes a bookmakers list under the sport's odds namespace.
-        """
-        # pick the sport root the same way you already route fixtures/odds
-        if league == "soccer":
-            path = "/odds/bookmakers"      # API-Football v3
-            base = self._football_base     # whatever you use for soccer
-        else:
-            path = "/odds/bookmakers"      # American Football odds catalog
-            base = self._gridiron_base     # your AF base (nfl/ncaaf)
-
-        url = f"{base}{path}"
-        return self._get(url, params={})   # mirrors your other GET helpers
-
 
 class ApiSportsClient:
     def __init__(self, api_key: str, timeout: float = 20.0):
@@ -110,7 +90,11 @@ class ApiSportsClient:
         params.update({k: v for k, v in (kw or {}).items() if v is not None})
         return self._get(url, params)
 
-    def odds_bookmakers(self, league: League) -> Dict[str, Any]:
+    def bookmakers(self, league: League) -> Dict[str, Any]:
+        """
+        API-Sports bookmaker catalog for the league's sport family.
+        Football (soccer) v3 and American Football/Basketball v1 use the same path.
+        """
         base = get_base_for_league(league)
         return self._get(f"{base}/odds/bookmakers", {})
 
@@ -158,9 +142,9 @@ class ApiSportsClient:
     def injuries(
         self,
         league: League,
-        date: Optional[str] = None,            # "YYYY-MM-DD" (ignored for AF)
+        date: Optional[str] = None,    # "YYYY-MM-DD" (ignored by AF)
         league_id: Optional[int] = None,
-        **kw: Any,                              # allows season/team/player passthrough
+        **kw: Any,
     ) -> Dict[str, Any]:
         base = get_base_for_league(league)
         params: Dict[str, Any] = {}
