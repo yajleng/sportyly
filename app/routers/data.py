@@ -10,16 +10,14 @@ from ..clients.apisports import ApiSportsClient, League
 from ..core.config import get_settings
 from ..services.odds import normalize_odds
 from ..services.resolve import resolve_fixture_id
-from ..services.validation import validate_league  # used by /bookmakers
+from ..services.validation import validate_league
 from ..schemas.query import SlateQuery, ResolveQuery, OddsQuery
 
 router = APIRouter(prefix="/data", tags=["data"])
 
-
 def _client() -> ApiSportsClient:
     settings = get_settings()
     return ApiSportsClient(api_key=settings.apisports_key)
-
 
 # ---------- helpers ----------
 def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,7 +50,6 @@ def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
             "venue_city": venue_city,
         }
 
-
 # ---------------- Bookmakers ----------------
 @router.get(
     "/bookmakers",
@@ -75,7 +72,6 @@ def bookmakers(league: League = Query(..., description="nba | nfl | ncaaf | ncaa
         return {"count": len(out), "league": league, "items": out}
     finally:
         c.close()
-
 
 # ---------------- Slate (daily fixtures) ----------------
 @router.get(
@@ -103,7 +99,6 @@ def slate(q: SlateQuery = Depends()):
         return {"count": len(rows), "league": q.league, "date": qdate, "items": rows}
     finally:
         client.close()
-
 
 # ---------------- Injuries (unified across sports) ----------------
 @router.get(
@@ -149,7 +144,6 @@ def injuries(
     finally:
         client.close()
 
-
 # ---------------- Resolve id by teams/date ----------------
 @router.get("/resolve", summary="Resolve a fixture/game id by teams and date")
 def resolve_endpoint(q: ResolveQuery = Depends()):
@@ -166,7 +160,6 @@ def resolve_endpoint(q: ResolveQuery = Depends()):
         )
     finally:
         client.close()
-
 
 # ---------------- History (with optional odds) ----------------
 @router.get("/history")
@@ -232,7 +225,6 @@ def history(
         return {"count": len(out), "league": league, "range": [start_date, end_date], "items": out}
     finally:
         client.close()
-
 
 # ---------------- Odds (auto-resolve supported, strict params) ----------------
 @router.get(
