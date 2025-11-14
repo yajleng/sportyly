@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from typing import List, Optional, Dict, Any
-from fastapi import APIRouter, Query, HTTPException
 from datetime import date as _date
+from fastapi import APIRouter, Query, HTTPException
 
 from ..clients.apisports import ApiSportsClient, League
 from ..core.config import get_settings
@@ -16,6 +16,7 @@ router = APIRouter(prefix="/data", tags=["data"])
 def _client() -> ApiSportsClient:
     settings = get_settings()
     return ApiSportsClient(api_key=settings.apisports_key)
+
 
 # ---------- helpers ----------
 def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
@@ -48,19 +49,23 @@ def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
             "venue_city": venue_city,
         }
 
-# ---------------- Slate (daily fixtures) ----------------
+
+# ---------------- SLATE (timezone-aware, resilient) ----------------
 @router.get(
     "/slate",
-    summary="Get daily slate (fixtures) for a league",
+    summary="Day slate (timezone-aware)",
     description=(
-        "Returns the day's fixtures with normalized fields. "
-        "For soccer, you may pass league_id_override (competition) and season."
+        "Return all fixtures for a given day. "
+        "`date` is interpreted in `tz` (default America/New_York). "
+        "Tries a strict local day first, then a small grace window to catch midnight rollovers. "
+        "Soccer can accept `league_id_override` (competition) and `season`."
     ),
 )
 def slate(
     league: League,
     date: Optional[str] = Query(None, description="YYYY-MM-DD (defaults to today)"),
-    season: Optional[int] = Query(None, description="Season (soccer optional, others ignored)"),
+    tz: str = Query("America/New_York", description="IANA timezone for the calendar day"),
+    season: Optional[int] = Query(None, description="Season year (soccer often required; AF ignored unless provider needs it)"),
     league_id_override: Optional[int] = Query(None, description="Soccer competition ID (e.g., EPL=39)"),
 ):
     settings = get_settings()
@@ -69,45 +74,71 @@ def slate(
 
     qdate = date or _date.today().isoformat()
 
-    client = _client()
+    c = _client()
     try:
-        fx = client.fixtures_by_date(
-            league=league,
-            date=qdate,
-            season=season,
-            league_id=league_id_override,
-        )
+        # 1) Preferred: provider's native "by date" with timezone (if client supports tz passthrough)
+        try:
+            fx = c.fixtures_by_date(
+                league=league,
+                date=qdate,
+                season=season,
+                league_id=league_id_override,
+                timezone=tz,
+            )
+        except TypeError:
+            # older client signature without timezone
+            fx = c.fixtures_by_date(
+                league=league,
+                date=qdate,
+                season=season,
+                league_id=league_id_override,
+            )
         items = fx.get("response") or fx.get("results") or []
+
+        # 2) Fallback: explicit range for the same local day with a small grace window
+        if not items:
+            try:
+                fx2 = c.fixtures_range(
+                    league=league,
+                    from_date=qdate,           # interpreted as local day start in tz by the client
+                    to_date=qdate,             # interpreted as same-day end in tz by the client
+                    season=season,
+                    league_id=league_id_override,
+                    timezone=tz,
+                    grace_hours=6,             # widen a bit around local-midnight
+                )
+            except TypeError:
+                # client without timezone/grace support: use a blunt exact call
+                fx2 = c.fixtures_range(
+                    league=league,
+                    from_date=qdate,
+                    to_date=qdate,
+                    season=season,
+                    league_id=league_id_override,
+                )
+            items = fx2.get("response") or fx2.get("results") or []
+
         rows = [_extract_game_row(league, g) for g in items]
-        # filter any without id just in case
         rows = [r for r in rows if r.get("fixture_id") is not None]
         return {"count": len(rows), "league": league, "date": qdate, "items": rows}
     finally:
-        client.close()
+        c.close()
+
 
 # ---------------- Injuries (unified across sports) ----------------
 @router.get(
     "/injuries",
     summary="Unified injuries",
     description=(
-        "Get current injuries from API-SPORTS.\n\n"
-        "**Rules by league:**\n"
-        "- **nfl / ncaaf** (american-football): **team OR player is required** (at least one).\n"
-        "- **soccer** (API-Football v3): **league_id_override** (competition) **AND** **season** are required; team/player optional.\n"
-        "- **nba / ncaab**: injuries not provided by API-SPORTS → 501.\n\n"
-        "**Examples:**\n"
-        "- NFL by team: `/data/injuries?league=nfl&team=15`\n"
-        "- NFL by player: `/data/injuries?league=nfl&player=53`\n"
-        "- Soccer (EPL): `/data/injuries?league=soccer&league_id_override=39&season=2025`\n"
-        "- NBA (not supported): `/data/injuries?league=nba`\n"
+        "american-football (nfl/ncaaf): team OR player required. "
+        "soccer: league_id_override + season required. "
+        "nba/ncaab: not provided by API-SPORTS."
     ),
 )
 def injuries(
     league: League = Query(..., description="nba | nfl | ncaaf | ncaab | soccer"),
     season: Optional[int] = Query(None, description="Required for soccer; ignored by NFL/NCAAF", example=2025),
-    league_id_override: Optional[int] = Query(
-        None, description="Soccer competition ID (e.g., EPL=39, LaLiga=140, MLS=253)", example=39
-    ),
+    league_id_override: Optional[int] = Query(None, description="Soccer competition ID (e.g., EPL=39)", example=39),
     team: Optional[int] = Query(None, description="Team ID (required for NFL/NCAAF if player not given)", example=15),
     player: Optional[int] = Query(None, description="Player ID (required for NFL/NCAAF if team not given)", example=53),
 ):
@@ -116,7 +147,7 @@ def injuries(
     if league in ("nfl", "ncaaf") and not (team or player):
         raise HTTPException(status_code=422, detail="NFL/NCAAF injuries require at least one of: team or player.")
     if league == "soccer" and not (league_id_override and season):
-        raise HTTPException(status_code=422, detail="Soccer injuries require league_id_override (competition) and season.")
+        raise HTTPException(status_code=422, detail="Soccer injuries require league_id_override and season.")
 
     settings = get_settings()
     if not settings.apisports_key:
@@ -136,8 +167,13 @@ def injuries(
     finally:
         client.close()
 
-# ---------------- Resolve id by teams/date ----------------
-@router.get("/resolve", summary="Resolve a fixture/game id by teams and date")
+
+# ---------------- Resolve (teams/date -> fixture_id) ----------------
+@router.get(
+    "/resolve",
+    summary="Resolve a fixture/game id by teams and date",
+    description="Return best guess plus candidate list. Soccer can pass league_id_override + season."
+)
 def resolve_endpoint(
     league: League,
     date: str,
@@ -160,12 +196,13 @@ def resolve_endpoint(
     finally:
         client.close()
 
+
 # ---------------- History (with optional odds) ----------------
-@router.get("/history")
+@router.get("/history", summary="Fixtures in range (optionally attach odds)")
 def history(
     league: League,
-    start_date: str,
-    end_date: str,
+    start_date: str,                 # YYYY-MM-DD
+    end_date: str,                   # YYYY-MM-DD
     season: Optional[int] = None,
     include_odds: bool = False,
     league_id_override: Optional[int] = None,
@@ -225,13 +262,12 @@ def history(
     finally:
         client.close()
 
+
 # ---------------- Odds (auto-resolve supported) ----------------
 @router.get(
     "/odds",
     summary="Fixture/game odds (raw or normalized)",
-    description=(
-        "Pass a `fixture_id` (soccer fixture / AF game id) **or** give `date + home + away` and I will resolve the id first."
-    ),
+    description="Provide `fixture_id` or let the API auto-resolve via (`date` + `home` and/or `away`)."
 )
 def odds(
     league: League,
@@ -268,8 +304,10 @@ def odds(
                 })
 
         extra: dict = {}
-        if bookmaker_id is not None: extra["bookmaker"] = bookmaker_id
-        if bet_id is not None: extra["bet"] = bet_id
+        if bookmaker_id is not None:
+            extra["bookmaker"] = bookmaker_id
+        if bet_id is not None:
+            extra["bet"] = bet_id
 
         payload = client.odds_for_fixture(league, int(fixture_id), **extra)
         return payload if raw else {
