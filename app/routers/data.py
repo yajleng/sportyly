@@ -1,9 +1,9 @@
 # app/routers/data.py
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any, cast
-from datetime import date as _date
+from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Query, HTTPException
+from datetime import date as _date
 
 from ..clients.apisports import ApiSportsClient, League
 from ..core.config import get_settings
@@ -12,35 +12,42 @@ from ..services.resolve import resolve_fixture_id
 
 router = APIRouter(prefix="/data", tags=["data"])
 
+# --------- helpers ---------
+_LEAGUE_ALIASES = {
+    "ncaaf": "ncaaf",
+    "cfb": "ncaaf",
+    "ncaafootball": "ncaaf",
+    "college_football": "ncaaf",
+    "ncaaF": "ncaaf",
+    "NCaaF": "ncaaf",
+    "CFB": "ncaaf",
+    "NcAaF": "ncaaf",
+    "nfl": "nfl",
+    "nba": "nba",
+    "ncaab": "ncaab",
+    "cbb": "ncaab",
+    "soccer": "soccer",
+}
+
+def _normalize_league(league_str: str) -> League:
+    key = (league_str or "").strip()
+    # fast path if already correct lowercase value
+    if key in ("nba", "nfl", "ncaaf", "ncaab", "soccer"):
+        return key  # type: ignore[return-value]
+    # try alias map (case-insensitive)
+    mapped = _LEAGUE_ALIASES.get(key) or _LEAGUE_ALIASES.get(key.lower())
+    if mapped in ("nba", "nfl", "ncaaf", "ncaab", "soccer"):
+        return mapped  # type: ignore[return-value]
+    # final guardrail: show the accepted list
+    raise HTTPException(
+        status_code=422,
+        detail="Input should be one of: 'nba', 'nfl', 'ncaaf', 'ncaab', 'soccer'.",
+    )
 
 def _client() -> ApiSportsClient:
     settings = get_settings()
     return ApiSportsClient(api_key=settings.apisports_key)
 
-# ---------- league normalization ----------
-# Accept common aliases & any casing. Map to canonical League literals.
-_LEAGUE_ALIASES: Dict[str, League] = {
-    "nba": "nba",
-    "nfl": "nfl",
-    "ncaaf": "ncaaf",
-    "cfb": "ncaaf",                  # alias
-    "college_football": "ncaaf",     # alias
-    "ncaab": "ncaab",
-    "cbb": "ncaab",                  # alias
-    "soccer": "soccer",
-}
-
-def _normalize_league(value: str) -> League:
-    key = (value or "").strip().lower()
-    canon = _LEAGUE_ALIASES.get(key)
-    if not canon:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported league '{value}'. Use one of: nba, nfl, ncaaf (aliases: cfb, college_football), ncaab (alias: cbb), soccer."
-        )
-    return cast(League, canon)
-
-# ---------- helpers ----------
 def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize minimal game fields across sports."""
     if league == "soccer":
@@ -71,87 +78,80 @@ def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
             "venue_city": venue_city,
         }
 
-# ---------------- Slate (daily fixtures) ----------------
+# ---------------- Slate (daily fixtures, tz-aware) ----------------
 @router.get(
     "/slate",
     summary="Get daily slate (fixtures) for a league",
     description=(
         "Returns the day's fixtures with normalized fields. "
-        "League is case-insensitive and supports aliases: cfb→ncaaf, cbb→ncaab. "
+        "Use tz (IANA) to define the calendar day window; defaults to America/New_York. "
         "For soccer, you may pass league_id_override (competition) and season."
     ),
 )
 def slate(
     league: str,
     date: Optional[str] = Query(None, description="YYYY-MM-DD (defaults to today)"),
-    season: Optional[int] = Query(None, description="Season (soccer optional, others ignored)"),
+    tz: str = Query("America/New_York", description="IANA timezone for calendar-day bucketing"),
+    season: Optional[int] = Query(None, description="Season (soccer optional, NCAA often needed)"),
     league_id_override: Optional[int] = Query(None, description="Soccer competition ID (e.g., EPL=39)"),
 ):
+    norm_league: League = _normalize_league(league)
     settings = get_settings()
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
 
-    canon = _normalize_league(league)
     qdate = date or _date.today().isoformat()
 
-    client = _client()
+    c = _client()
     try:
-        fx = client.fixtures_by_date(
-            league=canon,
+        fx = c.fixtures_by_date(
+            league=norm_league,
             date=qdate,
             season=season,
             league_id=league_id_override,
+            timezone=tz,  # let provider do local-day bucketing
         )
         items = fx.get("response") or fx.get("results") or []
-        rows = [_extract_game_row(canon, g) for g in items]
+        rows = [_extract_game_row(norm_league, g) for g in items]
         rows = [r for r in rows if r.get("fixture_id") is not None]
-        return {"count": len(rows), "league": canon, "date": qdate, "items": rows}
+        return {"count": len(rows), "league": norm_league, "date": qdate, "items": rows}
     finally:
-        client.close()
+        c.close()
 
 # ---------------- Injuries (unified across sports) ----------------
-@router.get(
-    "/injuries",
-    summary="Unified injuries",
-    description=(
-        "Get current injuries from API-SPORTS. League is case-insensitive (cfb→ncaaf, cbb→ncaab). "
-        "Rules: NFL/NCAAF require team or player. Soccer requires league_id_override + season. "
-        "NBA/NCAAB not provided (501)."
-    ),
-)
+@router.get("/injuries", summary="Unified injuries")
 def injuries(
-    league: str = Query(..., description="nba | nfl | ncaaf | ncaab | soccer (aliases ok: cfb, cbb)"),
+    league: str = Query(..., description="nba | nfl | ncaaf | ncaab | soccer (aliases like cfb accepted)"),
     season: Optional[int] = Query(None, description="Required for soccer; ignored by NFL/NCAAF", example=2025),
-    league_id_override: Optional[int] = Query(None, description="Soccer competition ID (e.g., EPL=39)", example=39),
+    league_id_override: Optional[int] = Query(
+        None, description="Soccer competition ID (e.g., EPL=39, LaLiga=140, MLS=253)", example=39
+    ),
     team: Optional[int] = Query(None, description="Team ID (required for NFL/NCAAF if player not given)", example=15),
     player: Optional[int] = Query(None, description="Player ID (required for NFL/NCAAF if team not given)", example=53),
 ):
-    canon = _normalize_league(league)
-
-    if canon in ("nba", "ncaab"):
+    norm_league: League = _normalize_league(league)
+    if norm_league in ("nba", "ncaab"):
         raise HTTPException(status_code=501, detail="Injuries are not provided for NBA/NCAAB by API-SPORTS.")
-    if canon in ("nfl", "ncaaf") and not (team or player):
+    if norm_league in ("nfl", "ncaaf") and not (team or player):
         raise HTTPException(status_code=422, detail="NFL/NCAAF injuries require at least one of: team or player.")
-    if canon == "soccer" and not (league_id_override and season):
+    if norm_league == "soccer" and not (league_id_override and season):
         raise HTTPException(status_code=422, detail="Soccer injuries require league_id_override and season.")
 
     settings = get_settings()
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
 
-    client = _client()
+    c = _client()
     try:
         kwargs: dict = {}
-        if team is not None:
-            kwargs["team"] = team
-        if player is not None:
-            kwargs["player"] = player
+        if team is not None: kwargs["team"] = team
+        if player is not None: kwargs["player"] = player
 
-        if canon == "soccer":
-            return client.injuries(canon, league_id=league_id_override, season=season, **kwargs)
-        return client.injuries(canon, **kwargs)
+        if norm_league == "soccer":
+            return c.injuries(norm_league, league_id=league_id_override, season=season, **kwargs)
+        return c.injuries(norm_league, **kwargs)
     finally:
-        client.close()
+        c.close()
 
 # ---------------- Resolve id by teams/date ----------------
 @router.get("/resolve", summary="Resolve a fixture/game id by teams and date")
@@ -163,20 +163,15 @@ def resolve_endpoint(
     league_id_override: Optional[int] = None,
     season: Optional[int] = None,
 ):
-    canon = _normalize_league(league)
-    client = _client()
+    norm_league: League = _normalize_league(league)
+    c = _client()
     try:
         return resolve_fixture_id(
-            client,
-            league=canon,
-            date=date,
-            home=home,
-            away=away,
-            league_id_override=league_id_override,
-            season=season,
+            c, league=norm_league, date=date, home=home, away=away,
+            league_id_override=league_id_override, season=season,
         )
     finally:
-        client.close()
+        c.close()
 
 # ---------------- History (with optional odds) ----------------
 @router.get("/history")
@@ -190,16 +185,15 @@ def history(
     bookmaker_id: Optional[int] = Query(None, description="Prefer odds from this bookmaker id"),
     max_odds_lookups: int = 200,
 ):
-    canon = _normalize_league(league)
-
+    norm_league: League = _normalize_league(league)
     settings = get_settings()
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
 
-    client = _client()
+    c = _client()
     try:
-        fx = client.fixtures_range(
-            league=canon,
+        fx = c.fixtures_range(
+            norm_league,
             from_date=start_date,
             to_date=end_date,
             season=season,
@@ -211,7 +205,7 @@ def history(
         lookups = 0
 
         for g in items:
-            if canon == "soccer":
+            if norm_league == "soccer":
                 fid = g["fixture"]["id"]
                 dt = g["fixture"]["date"]
                 home = g["teams"]["home"]["name"]
@@ -233,7 +227,7 @@ def history(
 
             if include_odds and lookups < max_odds_lookups and fid:
                 try:
-                    odds_raw = client.odds_for_fixture(canon, int(fid))
+                    odds_raw = c.odds_for_fixture(norm_league, int(fid))
                     row["odds"] = normalize_odds(odds_raw, preferred_bookmaker_id=bookmaker_id)
                     lookups += 1
                 except Exception:
@@ -241,18 +235,15 @@ def history(
 
             out.append(row)
 
-        return {"count": len(out), "league": canon, "range": [start_date, end_date], "items": out}
+        return {"count": len(out), "league": norm_league, "range": [start_date, end_date], "items": out}
     finally:
-        client.close()
+        c.close()
 
 # ---------------- Odds (auto-resolve supported) ----------------
 @router.get(
     "/odds",
     summary="Fixture/game odds (raw or normalized)",
-    description=(
-        "Pass a `fixture_id` (soccer fixture / AF game id) **or** give `date + home + away` and I will resolve the id first. "
-        "League is case-insensitive; aliases: cfb→ncaaf, cbb→ncaab."
-    ),
+    description="Pass a fixture_id or (date + home/away) and I will resolve first.",
 )
 def odds(
     league: str,
@@ -266,20 +257,19 @@ def odds(
     league_id_override: Optional[int] = None,
     season: Optional[int] = None,
 ):
-    canon = _normalize_league(league)
-
+    norm_league: League = _normalize_league(league)
     settings = get_settings()
     if not settings.apisports_key:
         raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
 
-    client = _client()
+    c = _client()
     try:
         resolved_reason = None
         if fixture_id is None:
             if not date or not (home or away):
                 raise HTTPException(status_code=422, detail="Provide fixture_id OR (date and at least one of home/away).")
             res = resolve_fixture_id(
-                client, league=canon, date=date, home=home, away=away,
+                c, league=norm_league, date=date, home=home, away=away,
                 league_id_override=league_id_override, season=season
             )
             fixture_id = res.get("fixture_id")
@@ -294,11 +284,11 @@ def odds(
         if bookmaker_id is not None: extra["bookmaker"] = bookmaker_id
         if bet_id is not None: extra["bet"] = bet_id
 
-        payload = client.odds_for_fixture(canon, int(fixture_id), **extra)
+        payload = c.odds_for_fixture(norm_league, int(fixture_id), **extra)
         return payload if raw else {
             "fixture_id": fixture_id,
             "resolved": resolved_reason,
             "odds": normalize_odds(payload, preferred_bookmaker_id=bookmaker_id),
         }
     finally:
-        client.close()
+        c.close()
