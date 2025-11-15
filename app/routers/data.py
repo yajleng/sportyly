@@ -365,3 +365,117 @@ def game_player_stats(
         )
     finally:
         c.close()
+
+from fastapi import APIRouter, HTTPException, Query
+# ...existing imports...
+from ..services.resolve import resolve_fixture_id
+from ..services.validation import validate_league
+
+# ---------------- Stats: game team boxscore (auto-resolve) ----------------
+@router.get(
+    "/stats/game/teams",
+    summary="Team stats for a single game (auto-resolve id)",
+    description="For nfl/ncaaf/nba/ncaab supply game_id OR date+home+away. Soccer not supported here."
+)
+def stats_game_teams(
+    league: League = Query(..., description="nfl | ncaaf | nba | ncaab"),
+    game_id: Optional[int] = Query(None, description="Game/fixture id"),
+    date: Optional[str] = Query(None, description="YYYY-MM-DD (used for resolve)"),
+    home: Optional[str] = Query(None, description="Home team name (resolve aid)"),
+    away: Optional[str] = Query(None, description="Away team name (resolve aid)"),
+    league_id_override: Optional[int] = None,
+    season: Optional[int] = None,
+):
+    validate_league(league)
+    if league == "soccer":
+        raise HTTPException(status_code=422, detail="Use /data/stats/soccer/team for soccer.")
+
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+
+    client = _client()
+    try:
+        gid = game_id
+        if gid is None:
+            if not date or not (home or away):
+                raise HTTPException(status_code=422,
+                    detail="Provide game_id OR (date and at least one of home/away).")
+            res = resolve_fixture_id(
+                client, league=league, date=date, home=home, away=away,
+                league_id_override=league_id_override, season=season
+            )
+            gid = res.get("fixture_id")
+            if not gid:
+                raise HTTPException(status_code=409, detail={
+                    "message": "Could not confidently resolve fixture; confirm one candidate.",
+                    "candidates": res.get("candidates", []),
+                })
+        return client.stats_game_teams(league, int(gid))
+    finally:
+        client.close()
+
+# ---------------- Stats: game player boxscore (auto-resolve) ----------------
+@router.get(
+    "/stats/game/players",
+    summary="Player stats for a single game (auto-resolve id)",
+    description="For nfl/ncaaf/nba/ncaab supply game_id OR date+home+away."
+)
+def stats_game_players(
+    league: League = Query(..., description="nfl | ncaaf | nba | ncaab"),
+    game_id: Optional[int] = Query(None),
+    date: Optional[str] = Query(None),
+    home: Optional[str] = Query(None),
+    away: Optional[str] = Query(None),
+    league_id_override: Optional[int] = None,
+    season: Optional[int] = None,
+):
+    validate_league(league)
+    if league == "soccer":
+        raise HTTPException(status_code=422, detail="Use /data/stats/soccer/team for soccer.")
+
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+
+    client = _client()
+    try:
+        gid = game_id
+        if gid is None:
+            if not date or not (home or away):
+                raise HTTPException(status_code=422,
+                    detail="Provide game_id OR (date and at least one of home/away).")
+            res = resolve_fixture_id(
+                client, league=league, date=date, home=home, away=away,
+                league_id_override=league_id_override, season=season
+            )
+            gid = res.get("fixture_id")
+            if not gid:
+                raise HTTPException(status_code=409, detail={
+                    "message": "Could not confidently resolve fixture; confirm one candidate.",
+                    "candidates": res.get("candidates", []),
+                })
+        return client.stats_game_players(league, int(gid))
+    finally:
+        client.close()
+
+# ---------------- Stats: soccer team season ----------------
+@router.get(
+    "/stats/soccer/team",
+    summary="Soccer season team statistics (v3)",
+    description="GET /teams/statistics?team=&league=&season="
+)
+def stats_soccer_team(
+    team_id: int = Query(...),
+    league_id: int = Query(...),
+    season: int = Query(...)
+):
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+    client = _client()
+    try:
+        return client.soccer_team_statistics(team_id=team_id, league_id=league_id, season=season)
+    finally:
+        client.close()
+
