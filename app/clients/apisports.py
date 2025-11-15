@@ -56,6 +56,10 @@ class ApiSportsClient:
             raise ApiSportsError(f"GET {url} -> {resp.status_code}: {body}") from e
         return resp.json()
 
+    @staticmethod
+    def _clean(d: Mapping[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in d.items() if v is not None}
+
     # ------------ fixtures (by date / range) ------------
     def fixtures_by_date(
         self,
@@ -173,3 +177,75 @@ class ApiSportsClient:
         """GET /odds/bookmakers (no params) for the league's family."""
         base = self._base(league)
         return self._get(f"{base}/odds/bookmakers")
+
+    # ================================================================
+    #                        NEW: STATS HELPERS
+    # ================================================================
+
+    # -- Soccer (season-level team statistics) --
+    def soccer_team_season_stats(
+        self, *, team_id: int, league_id: int, season: int
+    ) -> Dict[str, Any]:
+        """
+        API-Football v3: GET /teams/statistics
+        Required: team, league, season
+        """
+        base = self._base("soccer")
+        return self._get(
+            f"{base}/teams/statistics",
+            {"team": team_id, "league": league_id, "season": season},
+        )
+
+    # -- v1 families (NFL/NCAAF/NBA/NCAAB): per-game team statistics --
+    def game_team_stats(
+        self,
+        league: League,
+        *,
+        game_id: Optional[int] = None,     # -> id
+        game_ids: Optional[str] = None,    # -> ids  e.g. "123-456-789"
+        date: Optional[str] = None,        # -> date "YYYY-MM-DD"
+        timezone: Optional[str] = None,    # -> timezone
+    ) -> Dict[str, Any]:
+        """
+        GET /games/statistics/teams with one of: id | ids | date (+optional timezone).
+        """
+        base = self._base(league)
+        params = self._clean(
+            {
+                "id": game_id,
+                "ids": game_ids,
+                "date": date,
+                "timezone": timezone,
+            }
+        )
+        return self._get(f"{base}/games/statistics/teams", params)
+
+    # -- v1 families (NFL/NCAAF/NBA/NCAAB): per-game player statistics --
+    def game_player_stats(
+        self,
+        league: League,
+        *,
+        game_id: Optional[int] = None,     # -> id
+        game_ids: Optional[str] = None,    # -> ids
+        date: Optional[str] = None,        # -> date
+        timezone: Optional[str] = None,    # -> timezone
+        player_id: Optional[int] = None,   # some docs support season pulls by player
+        season: Optional[str] = None,      # e.g. "2024-2025"
+    ) -> Dict[str, Any]:
+        """
+        GET /games/statistics/players:
+          - by game id/ids/date (primary usage)
+          - optionally by player+season where the family supports it (e.g., basketball)
+        """
+        base = self._base(league)
+        params = self._clean(
+            {
+                "id": game_id,
+                "ids": game_ids,
+                "date": date,
+                "timezone": timezone,
+                "player": player_id,
+                "season": season,
+            }
+        )
+        return self._get(f"{base}/games/statistics/players", params)
