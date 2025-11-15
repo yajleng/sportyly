@@ -278,3 +278,25 @@ def soccer_team_statistics(self, *, team_id: int, league_id: int, season: int) -
             }
         )
         return self._get(f"{base}/games/statistics/players", params)
+
+    # ------------ game stats (teams & players) ------------
+    def game_team_stats(self, league: League, game_id: int) -> Dict[str, Any]:
+        """
+        NFL/NCAAF/NBA/NCAAB: GET /games/statistics/teams?id={game_id}
+        Soccer:               GET /fixtures/statistics?fixture={game_id}
+        """
+        base = self._base(league)
+        if league == "soccer":
+            return self._get(f"{base}/fixtures/statistics", {"fixture": game_id})
+        return self._get(f"{base}/games/statistics/teams", {"id": game_id})
+
+    def game_player_stats(self, league: League, game_id: int) -> Dict[str, Any]:
+        """
+        NFL/NCAAF/NBA/NCAAB: GET /games/statistics/players?id={game_id}
+        Soccer:               GET /fixtures/players?fixture={game_id}
+        """
+        base = self._base(league)
+        if league == "soccer":
+            return self._get(f"{base}/fixtures/players", {"fixture": game_id})
+        return self._get(f"{base}/games/statistics/players", {"id": game_id})
+
