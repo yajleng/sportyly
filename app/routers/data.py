@@ -1,7 +1,7 @@
 # app/routers/data.py
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import date as _date
 
 from fastapi import APIRouter, Query, HTTPException, Depends
@@ -14,20 +14,30 @@ from ..services.validation import validate_league
 from ..services.markets import resolve_bet_id
 from ..schemas.query import SlateQuery, ResolveQuery, OddsQuery
 from ..services.cache import cache  # small in-proc TTL cache
+# Optional derived metric (endpoint guarded by import’s existence)
+try:
+    from ..services.ratings import compute_efficiency
+except Exception:  # pragma: no cover
+    compute_efficiency = None  # type: ignore[assignment]
 
 router = APIRouter(prefix="/data", tags=["data"])
 
-# local League type to avoid cycles
-from typing import Literal
+# Local League literal to avoid import cycles
 League = Literal["nba", "nfl", "ncaaf", "ncaab", "soccer"]
 
 
+# ---------- client/key helpers ----------
 def _client() -> ApiSportsClient:
     settings = get_settings()
     return ApiSportsClient(api_key=settings.apisports_key)
 
+def _ensure_key():
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
 
-# ---------- helpers ----------
+
+# ---------- shape helpers ----------
 def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize minimal game fields across families."""
     if league == "soccer":
@@ -57,12 +67,6 @@ def _extract_game_row(league: League, g: Dict[str, Any]) -> Dict[str, Any]:
             "away": away,
             "venue_city": venue_city,
         }
-
-
-def _ensure_key():
-    settings = get_settings()
-    if not settings.apisports_key:
-        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
 
 
 def _auto_resolve_or_id(
@@ -144,11 +148,15 @@ def bookmakers(league: League = Query(..., description="nba | nfl | ncaaf | ncaa
     summary="Get daily slate (fixtures) for a league",
     description="Returns the day's fixtures with normalized fields.",
 )
-def slate(q: SlateQuery = Depends()):
+def slate(
+    q: SlateQuery = Depends(),
+    timezone: Optional[str] = Query(None, description="e.g., UTC, America/New_York"),
+    page: Optional[int] = Query(None, ge=1, description="Provider paging"),
+):
     _ensure_key()
     qdate = q.date or _date.today().isoformat()
 
-    key = ("slate", q.league, qdate, q.season, q.league_id_override)
+    key = ("slate", q.league, qdate, q.season, q.league_id_override, timezone, page)
     cached = cache.get(key)
     if cached is not None:
         return cached
@@ -160,6 +168,8 @@ def slate(q: SlateQuery = Depends()):
             date=qdate,
             season=q.season,
             league_id=q.league_id_override,
+            timezone=timezone,
+            page=page,
         )
         items = fx.get("response") or fx.get("results") or []
         rows = [_extract_game_row(q.league, g) for g in items]
@@ -244,6 +254,8 @@ def history(
     league_id_override: Optional[int] = None,
     bookmaker_id: Optional[int] = Query(None, description="Prefer odds from this bookmaker id"),
     max_odds_lookups: int = 200,
+    timezone: Optional[str] = None,
+    page: Optional[int] = None,
 ):
     _ensure_key()
 
@@ -255,6 +267,8 @@ def history(
             to_date=end_date,
             season=season,
             league_id=league_id_override,
+            timezone=timezone,
+            page=page,
         )
         items = fx.get("response") or fx.get("results") or []
 
@@ -321,7 +335,7 @@ def odds(q: OddsQuery = Depends(), market: Optional[str] = Query(None), period: 
         fixture_id = resolved["fixture_id"]
         resolved_reason = resolved["resolved"]
 
-        # Allow friendly aliases (spread/total/moneyline/player_points/etc.)
+        # Friendly alias -> bet id
         bet_id = q.bet_id
         if bet_id is None and market:
             bet_id = resolve_bet_id(q.league, market, period)
@@ -353,12 +367,12 @@ def odds(q: OddsQuery = Depends(), market: Optional[str] = Query(None), period: 
 )
 def props(
     league: League = Query(...),
+    market: str = Query(..., description="player prop alias, e.g., player_points, rush_yards"),
+    period: Optional[str] = Query(None),
     fixture_id: Optional[int] = Query(None),
     date: Optional[str] = Query(None),
     home: Optional[str] = Query(None),
     away: Optional[str] = Query(None),
-    market: str = Query(..., description="player prop alias, e.g., player_points, rush_yards"),
-    period: Optional[str] = Query(None),
     bookmaker_id: Optional[int] = Query(None),
     season: Optional[int] = Query(None),
     league_id_override: Optional[int] = Query(None),
@@ -385,11 +399,10 @@ def props(
         if bet_id is None:
             raise HTTPException(status_code=422, detail=f"Unknown market alias '{market}' for league '{league}'.")
 
-        payload = client.odds_for_fixture_props(league, fid, bet_id=bet_id, bookmaker=bookmaker_id)
+        payload = client.odds_for_fixture(league, fid, bookmaker=bookmaker_id, bet=bet_id)
         if raw:
             return payload
 
-        # Reuse normalize_odds; downstream picker will consume standardized rows
         return {
             "fixture_id": fid,
             "resolved": resolved["resolved"],
@@ -496,7 +509,7 @@ def stats_soccer_team(
 @router.get(
     "/stats/window/teams",
     summary="Windowed per-game team statistics (v1 families only)",
-    description="Collect per-game team stats for multiple games by ids (dash-separated) or a date (batch).",
+    description="Collect per-game team stats for multiple games by ids (dash-separated).",
 )
 def stats_window_teams(
     league: League = Query(..., description="nfl | ncaaf | nba | ncaab"),
@@ -547,5 +560,44 @@ def stats_window_players(
     try:
         data = client.game_player_stats_batch(league, ids)
         return {"league": league, "count": len(ids), "ids": ids, "data": data}
+    finally:
+        client.close()
+
+
+# ---------------- Derived Ratings (optional) ----------------
+@router.get("/ratings", summary="Computed team offensive/defensive ratings")
+def ratings(
+    league: League = Query(...),
+    team_name: str = Query(..., description="Exact team name as appears in API-Sports"),
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    season: Optional[int] = None,
+    league_id_override: Optional[int] = None,
+    window: int = Query(10, ge=1, le=40, description="Recent N games to average"),
+    timezone: Optional[str] = None,
+    page: Optional[int] = None,
+):
+    if compute_efficiency is None:
+        raise HTTPException(status_code=501, detail="ratings service not available in this build.")
+    _ensure_key()
+
+    client = _client()
+    try:
+        fx = client.fixtures_range(
+            league=league,
+            from_date=start_date,
+            to_date=end_date,
+            season=season,
+            league_id=league_id_override,
+            timezone=timezone,
+            page=page,
+        )
+        items = (fx.get("response") or fx.get("results") or [])[-window:]
+        return {
+            "league": league,
+            "team": team_name,
+            "window": len(items),
+            "ratings": compute_efficiency(items, team_name),  # type: ignore[misc]
+        }
     finally:
         client.close()
