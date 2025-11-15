@@ -282,3 +282,86 @@ def odds(q: OddsQuery = Depends()):
         }
     finally:
         client.close()
+# --- STATS ENDPOINTS ---------------------------------------------------------
+
+from fastapi import APIRouter, Query, HTTPException, Depends
+from ..services.validation import validate_league
+
+@router.get(
+    "/stats/soccer/team",
+    summary="Soccer team season statistics (API-Football v3)",
+    description="GET /teams/statistics?team=&league=&season=",
+)
+def soccer_team_stats(
+    team_id: int = Query(..., description="API-Football team id"),
+    league_id: int = Query(..., description="Competition id (e.g., EPL=39)"),
+    season: int = Query(..., description="Season year, e.g., 2025"),
+):
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+    c = _client()
+    try:
+        return c.soccer_team_season_stats(team_id=team_id, league_id=league_id, season=season)
+    finally:
+        c.close()
+
+
+@router.get(
+    "/stats/game/teams",
+    summary="Per-game team statistics (NFL/NCAAF/NBA/NCAAB)",
+    description="GET /games/statistics/teams by id | ids | date",
+)
+def game_team_stats(
+    league: League = Query(..., description="nfl | ncaaf | nba | ncaab"),
+    game_id: Optional[int] = Query(None, description="Single game id"),
+    game_ids: Optional[str] = Query(None, description='Dash-separated ids, e.g. "123-456"'),
+    date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    timezone: Optional[str] = Query(None, description="e.g. UTC or America/New_York"),
+):
+    validate_league(league)
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+    if not (game_id or game_ids or date):
+        raise HTTPException(status_code=422, detail="Provide one of: game_id | game_ids | date.")
+    c = _client()
+    try:
+        return c.game_team_stats(league, game_id=game_id, game_ids=game_ids, date=date, timezone=timezone)
+    finally:
+        c.close()
+
+
+@router.get(
+    "/stats/game/players",
+    summary="Per-game player statistics (NFL/NCAAF/NBA/NCAAB)",
+    description="GET /games/statistics/players by id | ids | date (optionally player/season where supported)",
+)
+def game_player_stats(
+    league: League = Query(..., description="nfl | ncaaf | nba | ncaab"),
+    game_id: Optional[int] = Query(None),
+    game_ids: Optional[str] = Query(None),
+    date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    timezone: Optional[str] = Query(None),
+    player_id: Optional[int] = Query(None, description="Optional filter (family-dependent)"),
+    season: Optional[str] = Query(None, description='Optional season like "2024-2025"'),
+):
+    validate_league(league)
+    settings = get_settings()
+    if not settings.apisports_key:
+        raise HTTPException(status_code=500, detail="APISPORTS_KEY missing")
+    if not (game_id or game_ids or date):
+        raise HTTPException(status_code=422, detail="Provide one of: game_id | game_ids | date.")
+    c = _client()
+    try:
+        return c.game_player_stats(
+            league,
+            game_id=game_id,
+            game_ids=game_ids,
+            date=date,
+            timezone=timezone,
+            player_id=player_id,
+            season=season,
+        )
+    finally:
+        c.close()
