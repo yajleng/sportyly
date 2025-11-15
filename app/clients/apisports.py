@@ -6,7 +6,6 @@ import httpx
 
 from ..core.config import get_base_for_league, get_league_id
 
-# Keep the type local here to avoid any import cycles
 League = Literal["nba", "nfl", "ncaaf", "ncaab", "soccer"]
 
 
@@ -19,24 +18,24 @@ class ApiSportsClient:
     Thin, uniform wrapper over API-SPORTS families.
 
     Soccer (API-Football v3): https://v3.football.api-sports.io
-      - fixtures:  GET /fixtures?date=&league=&season=
-                   GET /fixtures?from=&to=&league=&season=
-      - injuries:  GET /injuries?league=&season[&team][&player]
-      - odds:      GET /odds?fixture={id}[&bookmaker][&bet]
-      - books:     GET /odds/bookmakers
-      - stats:     GET /teams/statistics?team=&league=&season=
-                   GET /fixtures/statistics?fixture=
-                   GET /fixtures/players?fixture=
+      fixtures:  GET /fixtures?date=&league=&[season]
+                 GET /fixtures?from=&to=&league=&[season]
+      injuries:  GET /injuries?league=&season[&team][&player]
+      odds:      GET /odds?fixture={id}[&bookmaker][&bet]
+      books:     GET /odds/bookmakers
+      stats:     GET /teams/statistics?team=&league=&season=
+                 GET /fixtures/statistics?fixture=
+                 GET /fixtures/players?fixture=
 
     American Football (NFL/NCAAF, v1): https://v1.american-football.api-sports.io
     Basketball (NBA/NCAAB, v1):       https://v1.basketball.api-sports.io
-      - fixtures:  GET /games?date=&league=
-                   GET /games?from=&to=&league=
-      - injuries:  GET /injuries[?team][&player]  (NBA/NCAAB not supported)
-      - odds:      GET /odds?game={id}[&bookmaker][&bet]
-      - books:     GET /odds/bookmakers
-      - stats:     GET /games/statistics/teams?id= | ids=
-                   GET /games/statistics/players?id= | ids=
+      fixtures:  GET /games?date=&league=
+                 GET /games?from=&to=&league=
+      injuries:  GET /injuries[?team][&player]      (NBA/NCAAB not supported)
+      odds:      GET /odds?game={id}[&bookmaker][&bet]
+      books:     GET /odds/bookmakers
+      stats:     GET /games/statistics/teams?id= | ids=
+                 GET /games/statistics/players?id= | ids=
     """
 
     # ------------ lifecycle ------------
@@ -55,7 +54,7 @@ class ApiSportsClient:
     def __exit__(self, *_exc) -> None:
         self.close()
 
-    # ------------ low-level helpers ------------
+    # ------------ internals ------------
     def _base(self, league: League) -> str:
         return get_base_for_league(league)
 
@@ -70,7 +69,10 @@ class ApiSportsClient:
             except Exception:
                 pass
             raise ApiSportsError(f"GET {url} -> {resp.status_code}: {body}") from e
-        return resp.json()
+        try:
+            return resp.json()
+        except Exception as e:
+            raise ApiSportsError(f"GET {url} parse error: {e}") from e
 
     @staticmethod
     def _clean(d: Mapping[str, Any]) -> Dict[str, Any]:
@@ -87,6 +89,8 @@ class ApiSportsClient:
         date: str,                       # "YYYY-MM-DD"
         season: Optional[int] = None,
         league_id: Optional[int] = None,
+        timezone: Optional[str] = None,
+        page: Optional[int] = None,
     ) -> Dict[str, Any]:
         base = self._base(league)
         if league == "soccer":
@@ -99,6 +103,12 @@ class ApiSportsClient:
             lid = get_league_id(league, league_id)
             url = f"{base}/games"
             params = {"date": date, "league": lid}
+
+        if timezone:
+            params["timezone"] = timezone
+        if page:
+            params["page"] = page
+
         return self._get(url, params)
 
     def fixtures_range(
@@ -108,6 +118,8 @@ class ApiSportsClient:
         to_date: str,                    # "YYYY-MM-DD"
         season: Optional[int] = None,
         league_id: Optional[int] = None,
+        timezone: Optional[str] = None,
+        page: Optional[int] = None,
     ) -> Dict[str, Any]:
         base = self._base(league)
         if league == "soccer":
@@ -120,6 +132,12 @@ class ApiSportsClient:
             lid = get_league_id(league, league_id)
             url = f"{base}/games"
             params = {"from": from_date, "to": to_date, "league": lid}
+
+        if timezone:
+            params["timezone"] = timezone
+        if page:
+            params["page"] = page
+
         return self._get(url, params)
 
     # ------------ injuries ------------
@@ -193,28 +211,25 @@ class ApiSportsClient:
         fixture_id: int,
         *,
         bet_id: Optional[int] = None,
-        bookmaker: Optional[int] = None
+        bookmaker: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Friendly alias for props pulls (for GPT readability)."""
+        """Alias for prop pulls (same endpoint; just a naming convenience)."""
         return self.odds_for_fixture(league, fixture_id, bookmaker=bookmaker, bet=bet_id)
 
     # ------------ bookmakers ------------
     def bookmakers(self, league: League) -> Dict[str, Any]:
-        """GET /odds/bookmakers (no params) for the league's family."""
         base = self._base(league)
         return self._get(f"{base}/odds/bookmakers")
 
     # ------------ stats: soccer season team ------------
-    def soccer_team_season_stats(
-        self, *, team_id: int, league_id: int, season: int
-    ) -> Dict[str, Any]:
+    def soccer_team_season_stats(self, *, team_id: int, league_id: int, season: int) -> Dict[str, Any]:
         base = self._base("soccer")
         return self._get(
             f"{base}/teams/statistics",
             {"team": team_id, "league": league_id, "season": season},
         )
 
-    # ------------ stats: game team + player (single) ------------
+    # ------------ stats: single game (teams/players) ------------
     def game_team_stats(self, league: League, game_id: int) -> Dict[str, Any]:
         base = self._base(league)
         if league == "soccer":
@@ -227,13 +242,17 @@ class ApiSportsClient:
             return self._get(f"{base}/fixtures/players", {"fixture": game_id})
         return self._get(f"{base}/games/statistics/players", {"id": game_id})
 
-    # ------------ stats: batch by ids (v1 families) ------------
+    # ------------ stats: batch by ids (v1 families only) ------------
     def game_team_stats_batch(self, league: League, game_ids: List[int]) -> Dict[str, Any]:
         base = self._base(league)
+        if league == "soccer":
+            raise ApiSportsError("Batch team stats not supported for soccer (use per-fixture).")
         ids = self._join_ids(game_ids)
         return self._get(f"{base}/games/statistics/teams", self._clean({"ids": ids}))
 
     def game_player_stats_batch(self, league: League, game_ids: List[int]) -> Dict[str, Any]:
         base = self._base(league)
+        if league == "soccer":
+            raise ApiSportsError("Batch player stats not supported for soccer (use per-fixture).")
         ids = self._join_ids(game_ids)
         return self._get(f"{base}/games/statistics/players", self._clean({"ids": ids}))
