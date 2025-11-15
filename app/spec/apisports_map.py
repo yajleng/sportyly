@@ -1,4 +1,3 @@
-# app/spec/apisports_map.py
 from __future__ import annotations
 
 """
@@ -9,10 +8,11 @@ Exports
 MAP                : fast path id→alias/periods map (per league)
 NAME_FALLBACKS     : resilient market-name classifiers (alias inference)
 PERIOD_HINTS       : period inference from market/group names
-APISPORTS_SPEC     : minimal op schema we call per league family
+PROP_FALLBACKS     : name-based classifiers for player props
+APISPORTS_SPEC     : minimal op schema per league family
 """
 
-__all__ = ["MAP", "NAME_FALLBACKS", "PERIOD_HINTS", "APISPORTS_SPEC"]
+__all__ = ["MAP", "NAME_FALLBACKS", "PERIOD_HINTS", "PROP_FALLBACKS", "APISPORTS_SPEC"]
 
 # =========================
 # FAST PATH: id-based map
@@ -22,7 +22,7 @@ MAP: dict[str, dict] = {
     "nfl": {
         "bets": {
             # Moneyline
-            "1": {"alias": "moneyline", "periods": ["game"]},
+            "1":  {"alias": "moneyline", "periods": ["game"]},
 
             # Spread / Handicap
             "2":  {"alias": "spread", "periods": ["game", "1h", "2h"]},
@@ -109,7 +109,22 @@ PERIOD_HINTS: dict[str, list[str]] = {
 }
 
 # ======================================
+# Player prop fallbacks (name-based)
+# ======================================
+PROP_FALLBACKS: dict[str, list[str]] = {
+    "points":          ["player points", "points over/under", "over/under points"],
+    "rebounds":        ["player rebounds", "rebounds over/under"],
+    "assists":         ["player assists", "assists over/under"],
+    "passing_yards":   ["passing yards"],
+    "rushing_yards":   ["rushing yards"],
+    "receiving_yards": ["receiving yards"],
+    "receptions":      ["receptions"],
+    "touchdowns":      ["touchdowns"],
+}
+
+# ======================================
 # Minimal operation schema per family
+# (informational/validation only)
 # ======================================
 APISPORTS_SPEC = {
     "nfl": {
