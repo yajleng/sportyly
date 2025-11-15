@@ -1,3 +1,4 @@
+# app/services/resolve.py
 from __future__ import annotations
 from typing import Dict, Any, Optional, Tuple, List
 import re
@@ -69,8 +70,9 @@ def resolve_fixture_id(
         if score > best[1]:
             best = (r["fixture_id"], score, r)
 
-    picked_reason = None
-    picked = best[0] if best[1] >= 1.2 if (target_h and target_a) else best[1] >= 0.6 else None  # threshold tuned
-    if picked:
-        picked_reason = "High-confidence team match."
+    # Threshold: require higher score when both home+away provided
+    threshold = 1.2 if (target_h and target_a) else 0.6
+    picked = best[0] if (best[0] != -1 and best[1] >= threshold) else None
+
+    picked_reason = "High-confidence team match." if picked is not None else None
     return {"fixture_id": picked, "candidates": cands, "picked_reason": picked_reason}
