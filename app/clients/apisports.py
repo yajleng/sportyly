@@ -1,12 +1,12 @@
 # app/clients/apisports.py
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Literal, Mapping
+from typing import Any, Dict, Mapping, Optional, Literal
 import httpx
 
 from ..core.config import get_base_for_league, get_league_id
 
-# Keep the type local here to avoid any import cycles
+# Keep local to avoid any import cycles from routers
 League = Literal["nba", "nfl", "ncaaf", "ncaab", "soccer"]
 
 
@@ -40,6 +40,10 @@ class ApiSportsClient:
         self.close()
 
     # ------------ low-level helpers ------------
+    @staticmethod
+    def _clean(d: Mapping[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in d.items() if v is not None}
+
     def _base(self, league: League) -> str:
         return get_base_for_league(league)
 
@@ -56,11 +60,7 @@ class ApiSportsClient:
             raise ApiSportsError(f"GET {url} -> {resp.status_code}: {body}") from e
         return resp.json()
 
-    @staticmethod
-    def _clean(d: Mapping[str, Any]) -> Dict[str, Any]:
-        return {k: v for k, v in d.items() if v is not None}
-
-    # ------------ fixtures (by date / range) ------------
+    # ------------ fixtures ------------
     def fixtures_by_date(
         self,
         league: League,
@@ -118,32 +118,19 @@ class ApiSportsClient:
         NBA/NCAAB: not provided by API-SPORTS
         """
         base = self._base(league)
-
         if league == "soccer":
-            url = f"{base}/injuries"
-            params: Dict[str, Any] = {}
-            if league_id is not None:
-                params["league"] = league_id
-            if season is not None:
-                params["season"] = season
-            if team is not None:
-                params["team"] = team
-            if player is not None:
-                params["player"] = player
-            return self._get(url, params)
-
+            return self._get(
+                f"{base}/injuries",
+                self._clean({"league": league_id, "season": season, "team": team, "player": player}),
+            )
         if league in ("nfl", "ncaaf"):
-            url = f"{base}/injuries"
-            params: Dict[str, Any] = {}
-            if team is not None:
-                params["team"] = team
-            if player is not None:
-                params["player"] = player
-            return self._get(url, params)
-
+            return self._get(
+                f"{base}/injuries",
+                self._clean({"team": team, "player": player}),
+            )
         raise ApiSportsError(f"Injuries not available for league '{league}'")
 
-    # ------------ odds for a fixture/game ------------
+    # ------------ odds ------------
     def odds_for_fixture(
         self,
         league: League,
@@ -157,129 +144,32 @@ class ApiSportsClient:
         v1 families: /odds?game={id}[&bookmaker][&bet]
         """
         base = self._base(league)
-
         if league == "soccer":
             url = f"{base}/odds"
             params: Dict[str, Any] = {"fixture": fixture_id}
         else:
             url = f"{base}/odds"
             params = {"game": fixture_id}
-
         if bookmaker is not None:
             params["bookmaker"] = bookmaker
         if bet is not None:
             params["bet"] = bet
-
         return self._get(url, params)
 
-    # ------------ bookmakers ------------
     def bookmakers(self, league: League) -> Dict[str, Any]:
-        """GET /odds/bookmakers (no params) for the league's family."""
+        """GET /odds/bookmakers (no params) for the league family."""
         base = self._base(league)
         return self._get(f"{base}/odds/bookmakers")
 
-    # ================================================================
-    #                        NEW: STATS HELPERS
-    # ================================================================
-
-    # -- Soccer (season-level team statistics) --
-    def soccer_team_season_stats(
-        self, *, team_id: int, league_id: int, season: int
-    ) -> Dict[str, Any]:
-        """
-        API-Football v3: GET /teams/statistics
-        Required: team, league, season
-        """
+    # ------------ stats ------------
+    def soccer_team_season_stats(self, *, team_id: int, league_id: int, season: int) -> Dict[str, Any]:
+        """API-Football v3: GET /teams/statistics?team=&league=&season="""
         base = self._base("soccer")
         return self._get(
             f"{base}/teams/statistics",
             {"team": team_id, "league": league_id, "season": season},
         )
 
-    # -- v1 families (NFL/NCAAF/NBA/NCAAB): per-game team statistics --
-    def game_team_stats(
-        self,
-        league: League,
-        *,
-        game_id: Optional[int] = None,     # -> id
-        game_ids: Optional[str] = None,    # -> ids  e.g. "123-456-789"
-        date: Optional[str] = None,        # -> date "YYYY-MM-DD"
-        timezone: Optional[str] = None,    # -> timezone
-    ) -> Dict[str, Any]:
-        """
-        GET /games/statistics/teams with one of: id | ids | date (+optional timezone).
-        """
-        base = self._base(league)
-        params = self._clean(
-            {
-                "id": game_id,
-                "ids": game_ids,
-                "date": date,
-                "timezone": timezone,
-            }
-        )
-        return self._get(f"{base}/games/statistics/teams", params)
-
-# --- ADD: game-level team stats (v1 families) ---
-def stats_game_teams(self, league: League, game_id: int) -> Dict[str, Any]:
-    """
-    American-football & basketball (v1):
-      GET /games/statistics/teams?id={game}
-    """
-    base = self._base(league)
-    return self._get(f"{base}/games/statistics/teams", {"id": game_id})
-
-# --- ADD: game-level player stats (v1 families) ---
-def stats_game_players(self, league: League, game_id: int) -> Dict[str, Any]:
-    """
-    American-football & basketball (v1):
-      GET /games/statistics/players?id={game}
-    """
-    base = self._base(league)
-    return self._get(f"{base}/games/statistics/players", {"id": game_id})
-
-# --- ADD: soccer season team stats (API-Football v3) ---
-def soccer_team_statistics(self, *, team_id: int, league_id: int, season: int) -> Dict[str, Any]:
-    """
-    Soccer (v3):
-      GET /teams/statistics?team={id}&league={id}&season={yyyy}
-    """
-    base = self._base("soccer")
-    return self._get(f"{base}/teams/statistics",
-                     {"team": team_id, "league": league_id, "season": season})
-
-    
-    # -- v1 families (NFL/NCAAF/NBA/NCAAB): per-game player statistics --
-    def game_player_stats(
-        self,
-        league: League,
-        *,
-        game_id: Optional[int] = None,     # -> id
-        game_ids: Optional[str] = None,    # -> ids
-        date: Optional[str] = None,        # -> date
-        timezone: Optional[str] = None,    # -> timezone
-        player_id: Optional[int] = None,   # some docs support season pulls by player
-        season: Optional[str] = None,      # e.g. "2024-2025"
-    ) -> Dict[str, Any]:
-        """
-        GET /games/statistics/players:
-          - by game id/ids/date (primary usage)
-          - optionally by player+season where the family supports it (e.g., basketball)
-        """
-        base = self._base(league)
-        params = self._clean(
-            {
-                "id": game_id,
-                "ids": game_ids,
-                "date": date,
-                "timezone": timezone,
-                "player": player_id,
-                "season": season,
-            }
-        )
-        return self._get(f"{base}/games/statistics/players", params)
-
-    # ------------ game stats (teams & players) ------------
     def game_team_stats(self, league: League, game_id: int) -> Dict[str, Any]:
         """
         NFL/NCAAF/NBA/NCAAB: GET /games/statistics/teams?id={game_id}
@@ -299,4 +189,3 @@ def soccer_team_statistics(self, *, team_id: int, league_id: int, season: int) -
         if league == "soccer":
             return self._get(f"{base}/fixtures/players", {"fixture": game_id})
         return self._get(f"{base}/games/statistics/players", {"id": game_id})
-
