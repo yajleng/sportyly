@@ -1,30 +1,78 @@
 # app/spec/apisports_map.py
 from __future__ import annotations
 
-# Minimal, high-signal contract for the operations we actually call.
-# Each op defines which params are required/optional for each league.
+# Public export surface
+__all__ = ["MAP", "APISPORTS_SPEC"]
+
+# -----------------------------------------------------------------------------
+# Alias → bet_id mapping (stub values). Replace string keys with real API-Sports
+# bet IDs per league when you have them. The app can run without these being
+# perfect; they’re only used when you want to resolve aliases -> bet filter.
+# -----------------------------------------------------------------------------
+MAP = {
+    "nfl": {
+        "bets": {
+            "1": {"alias": "moneyline", "periods": ["game"]},
+            "2": {"alias": "spread",    "periods": ["game", "1h", "2h"]},
+            "3": {"alias": "total",     "periods": ["game", "1h", "2h"]},
+        }
+    },
+    "ncaaf": {
+        "bets": {
+            "1": {"alias": "moneyline", "periods": ["game"]},
+            "2": {"alias": "spread",    "periods": ["game"]},
+            "3": {"alias": "total",     "periods": ["game"]},
+        }
+    },
+    "nba": {
+        "bets": {
+            "1": {"alias": "moneyline", "periods": ["game"]},
+            "2": {"alias": "spread",    "periods": ["game", "1h"]},
+            "3": {"alias": "total",     "periods": ["game", "1h"]},
+        }
+    },
+    "ncaab": {
+        "bets": {
+            "1": {"alias": "moneyline", "periods": ["game"]},
+            "2": {"alias": "spread",    "periods": ["game"]},
+            "3": {"alias": "total",     "periods": ["game"]},
+        }
+    },
+    "soccer": {
+        "bets": {
+            "1": {"alias": "moneyline", "periods": ["game"]},   # 1X2 in practice
+            "2": {"alias": "spread",    "periods": ["game"]},   # Asian handicap
+            "3": {"alias": "total",     "periods": ["game"]},   # Over/Under
+        }
+    },
+}
+
+# -----------------------------------------------------------------------------
+# Minimal operation schema we actually call per league family.
+# This is informational/validation-only; clients build URLs elsewhere.
+# -----------------------------------------------------------------------------
 APISPORTS_SPEC = {
     "nfl": {
         "base": "https://v1.american-football.api-sports.io",
         "ops": {
             "fixtures_by_date": {
                 "path": "/games",
-                "required": ["date"],   # YYYY-MM-DD (provider local rules)
-                "optional": [],
+                "required": ["date"],          # YYYY-MM-DD
+                "optional": ["league"],        # typically implied by base + headers
             },
             "fixtures_range": {
                 "path": "/games",
                 "required": ["from", "to"],
-                "optional": [],
+                "optional": ["league"],
             },
             "odds": {
                 "path": "/odds",
-                "required": ["game"],   # provider expects 'game' (id)
+                "required": ["game"],          # game id
                 "optional": ["bookmaker", "bet"],
             },
             "injuries": {
                 "path": "/injuries",
-                "required": [],         # must have at least one of team/player in our router
+                "required": [],                # router enforces team/player presence
                 "optional": ["team", "player"],
             },
         },
@@ -32,10 +80,68 @@ APISPORTS_SPEC = {
     "ncaaf": {
         "base": "https://v1.american-football.api-sports.io",
         "ops": {
-            "fixtures_by_date": {"path": "/games", "required": ["date"], "optional": ["season"]},
-            "fixtures_range":   {"path": "/games", "required": ["from", "to"], "optional": ["season"]},
-            "odds":             {"path": "/odds",  "required": ["game"], "optional": ["bookmaker", "bet"]},
-            "injuries":         {"path": "/injuries", "required": [], "optional": ["team", "player"]},
+            "fixtures_by_date": {
+                "path": "/games",
+                "required": ["date"],
+                "optional": ["league", "season"],
+            },
+            "fixtures_range": {
+                "path": "/games",
+                "required": ["from", "to"],
+                "optional": ["league", "season"],
+            },
+            "odds": {
+                "path": "/odds",
+                "required": ["game"],
+                "optional": ["bookmaker", "bet"],
+            },
+            "injuries": {
+                "path": "/injuries",
+                "required": [],
+                "optional": ["team", "player"],
+            },
+        },
+    },
+    "nba": {
+        "base": "https://v1.basketball.api-sports.io",
+        "ops": {
+            "fixtures_by_date": {
+                "path": "/games",
+                "required": ["date"],
+                "optional": ["league", "season"],
+            },
+            "fixtures_range": {
+                "path": "/games",
+                "required": ["from", "to"],
+                "optional": ["league", "season"],
+            },
+            "odds": {
+                "path": "/odds",
+                "required": ["game"],
+                "optional": ["bookmaker", "bet"],
+            },
+            # injuries not provided for NBA by API-Sports
+        },
+    },
+    "ncaab": {
+        "base": "https://v1.basketball.api-sports.io",
+        "ops": {
+            "fixtures_by_date": {
+                "path": "/games",
+                "required": ["date"],
+                "optional": ["league", "season"],
+            },
+            "fixtures_range": {
+                "path": "/games",
+                "required": ["from", "to"],
+                "optional": ["league", "season"],
+            },
+            "odds": {
+                "path": "/odds",
+                "required": ["game"],
+                "optional": ["bookmaker", "bet"],
+            },
+            # injuries not provided for NCAAB by API-Sports
         },
     },
     "soccer": {
@@ -53,15 +159,14 @@ APISPORTS_SPEC = {
             },
             "odds": {
                 "path": "/odds",
-                "required": ["fixture"],
+                "required": ["fixture"],       # fixture id
                 "optional": ["bookmaker", "bet"],
             },
             "injuries": {
                 "path": "/injuries",
-                "required": ["league", "season"],   # per provider, league+season mandatory
+                "required": ["league", "season"],
                 "optional": ["team", "player"],
             },
         },
     },
-    # Add more leagues here as you turn them on.
 }
