@@ -220,6 +220,35 @@ class ApiSportsClient:
         )
         return self._get(f"{base}/games/statistics/teams", params)
 
+# --- ADD: game-level team stats (v1 families) ---
+def stats_game_teams(self, league: League, game_id: int) -> Dict[str, Any]:
+    """
+    American-football & basketball (v1):
+      GET /games/statistics/teams?id={game}
+    """
+    base = self._base(league)
+    return self._get(f"{base}/games/statistics/teams", {"id": game_id})
+
+# --- ADD: game-level player stats (v1 families) ---
+def stats_game_players(self, league: League, game_id: int) -> Dict[str, Any]:
+    """
+    American-football & basketball (v1):
+      GET /games/statistics/players?id={game}
+    """
+    base = self._base(league)
+    return self._get(f"{base}/games/statistics/players", {"id": game_id})
+
+# --- ADD: soccer season team stats (API-Football v3) ---
+def soccer_team_statistics(self, *, team_id: int, league_id: int, season: int) -> Dict[str, Any]:
+    """
+    Soccer (v3):
+      GET /teams/statistics?team={id}&league={id}&season={yyyy}
+    """
+    base = self._base("soccer")
+    return self._get(f"{base}/teams/statistics",
+                     {"team": team_id, "league": league_id, "season": season})
+
+    
     # -- v1 families (NFL/NCAAF/NBA/NCAAB): per-game player statistics --
     def game_player_stats(
         self,
